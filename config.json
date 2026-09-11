@@ -1,0 +1,8 @@
+{
+  "interval_minutes": 20,
+  "break_seconds": 20,
+  "lock_workstation": false,
+  "allow_skip": false,
+  "title": "护眼休息",
+  "message": "请远眺约 6 米（20 英尺）外，放松眼睛。\n遵循 20-20-20 法则：每 20 分钟 · 看向 20 英尺外 · 持续 20 秒。"
+}

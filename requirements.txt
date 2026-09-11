@@ -1,0 +1,2 @@
+# 无第三方依赖。仅需 Python 3.11+（官方 Windows 安装包已含 tkinter）。
+# 本文件仅作说明；不要 pip install 任何包即可运行。
