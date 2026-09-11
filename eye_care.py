@@ -59,6 +59,8 @@ if IS_WINDOWS:
     IDI_APPLICATION = 32512
     MF_STRING = 0x0000
     MF_GRAYED = 0x0001
+    MF_CHECKED = 0x0008
+    MF_UNCHECKED = 0x0000
     MF_DISABLED = 0x0002
     MF_SEPARATOR = 0x0800
     TPM_LEFTALIGN = 0x0000
@@ -71,6 +73,7 @@ if IS_WINDOWS:
     ID_TRAY_BREAK = 1001
     ID_TRAY_EXIT = 1002
     ID_TRAY_ABOUT = 1003
+    ID_TRAY_AUTOSTART = 1004
 
     SM_CXSMICON = 49
     SM_CYSMICON = 50
@@ -471,6 +474,132 @@ class BreakOverlay:
             self.on_closed()
 
 
+
+# ---------------------------------------------------------------------------
+# 开机自启（当前用户 Startup 目录）
+# ---------------------------------------------------------------------------
+AUTOSTART_NAME = "护眼锁屏助手"
+# 当前进程用于开机自启的持久参数（不含 --once / --demo-seconds 等临时项）
+_PERSISTENT_ARGV: List[str] = []
+
+
+def persistent_argv_from(argv: Sequence[str]) -> List[str]:
+    """从启动参数中筛出应写入自启快捷方式的项。"""
+    out: List[str] = []
+    it = iter(list(argv))
+    for arg in it:
+        if arg in ("--once", "-v", "--verbose"):
+            continue
+        if arg == "--demo-seconds" or arg.startswith("--demo-seconds="):
+            if arg == "--demo-seconds":
+                next(it, None)
+            continue
+        out.append(arg)
+    return out
+
+
+def remember_persistent_argv(argv: Optional[Sequence[str]] = None) -> None:
+    global _PERSISTENT_ARGV
+    raw = list(argv) if argv is not None else list(sys.argv[1:])
+    _PERSISTENT_ARGV = persistent_argv_from(raw)
+
+
+def _autostart_argument_string(script: Path) -> str:
+    parts = [f'"{script}"']
+    for a in _PERSISTENT_ARGV:
+        if any(ch.isspace() for ch in a):
+            parts.append(f'"{a}"')
+        else:
+            parts.append(a)
+    return " ".join(parts)
+
+
+def _startup_dir() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        raise RuntimeError("找不到 APPDATA，无法配置开机自启")
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
+def autostart_candidates() -> List[Path]:
+    d = _startup_dir()
+    return [d / f"{AUTOSTART_NAME}.lnk", d / f"{AUTOSTART_NAME}.bat"]
+
+
+def is_autostart_enabled() -> bool:
+    if not IS_WINDOWS:
+        return False
+    try:
+        return any(p.is_file() for p in autostart_candidates())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def set_autostart_enabled(enabled: bool) -> bool:
+    """启用/关闭登录自启。成功返回 True。"""
+    if not IS_WINDOWS:
+        return False
+    try:
+        startup = _startup_dir()
+        startup.mkdir(parents=True, exist_ok=True)
+        lnk = startup / f"{AUTOSTART_NAME}.lnk"
+        bat = startup / f"{AUTOSTART_NAME}.bat"
+        if not enabled:
+            for p in (lnk, bat):
+                if p.is_file():
+                    p.unlink()
+            LOG.info("已关闭开机自启")
+            return True
+
+        pythonw = Path(sys.executable)
+        # Prefer pythonw.exe alongside python.exe
+        if pythonw.name.lower() == "python.exe":
+            candidate = pythonw.with_name("pythonw.exe")
+            if candidate.is_file():
+                pythonw = candidate
+        script = Path(__file__).resolve()
+        args_str = _autostart_argument_string(script)
+        # Create .lnk via PowerShell for consistency with Explorer Startup
+        # Escape for PowerShell single-quoted string: ' -> ''
+        ps_args = args_str.replace("'", "''")
+        ps = (
+            f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut(\"{lnk}\"); "
+            f"$s.TargetPath = \"{pythonw}\"; "
+            f"$s.Arguments = '{ps_args}'; "
+            f"$s.WorkingDirectory = \"{script.parent}\"; "
+            f"$s.WindowStyle = 7; "
+            f"$s.Description = '护眼锁屏助手 — 登录后自动启动'; "
+            f"$s.Save()"
+        )
+        # Use bat fallback if PowerShell fails
+        try:
+            r = __import__("subprocess").run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if r.returncode == 0 and lnk.is_file():
+                if bat.is_file():
+                    bat.unlink()
+                LOG.info("已开启开机自启: %s", lnk)
+                return True
+            LOG.warning("创建快捷方式失败，改用 bat: %s", (r.stderr or r.stdout)[:200])
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("创建快捷方式异常，改用 bat: %s", exc)
+
+        bat.write_text(
+            "@echo off\r\n"
+            + f'start "" "{pythonw}" {args_str}\r\n',
+            encoding="utf-8",
+        )
+        LOG.info("已开启开机自启: %s", bat)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        LOG.error("配置开机自启失败: %s", exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Windows 系统托盘（ctypes，无第三方依赖）
 # ---------------------------------------------------------------------------
@@ -835,6 +964,15 @@ class TrayIcon:
                 cmd = int(wparam) & 0xFFFF
                 if cmd == ID_TRAY_BREAK:
                     self.on_break()
+                elif cmd == ID_TRAY_AUTOSTART:
+                    want = not is_autostart_enabled()
+                    if not set_autostart_enabled(want):
+                        user32.MessageBoxW(
+                            hwnd,
+                            "无法修改开机自启。\n请检查 Startup 目录权限后重试。",
+                            APP_NAME,
+                            0x10,  # MB_ICONERROR
+                        )
                 elif cmd == ID_TRAY_ABOUT:
                     user32.MessageBoxW(
                         hwnd,
@@ -929,6 +1067,8 @@ class TrayIcon:
         )
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, ID_TRAY_BREAK, "立即开始休息")
+        auto_flags = MF_STRING | (MF_CHECKED if is_autostart_enabled() else MF_UNCHECKED)
+        user32.AppendMenuW(menu, auto_flags, ID_TRAY_AUTOSTART, "开机自动启动")
         user32.AppendMenuW(menu, MF_STRING, ID_TRAY_ABOUT, "关于")
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, "退出")
@@ -1251,7 +1391,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
+    raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    remember_persistent_argv(raw_argv)
+    args = parse_args(raw_argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
