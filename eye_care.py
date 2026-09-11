@@ -479,6 +479,39 @@ class BreakOverlay:
 # 开机自启（当前用户 Startup 目录）
 # ---------------------------------------------------------------------------
 AUTOSTART_NAME = "护眼锁屏助手"
+# 当前进程用于开机自启的持久参数（不含 --once / --demo-seconds 等临时项）
+_PERSISTENT_ARGV: List[str] = []
+
+
+def persistent_argv_from(argv: Sequence[str]) -> List[str]:
+    """从启动参数中筛出应写入自启快捷方式的项。"""
+    out: List[str] = []
+    it = iter(list(argv))
+    for arg in it:
+        if arg in ("--once", "-v", "--verbose"):
+            continue
+        if arg == "--demo-seconds" or arg.startswith("--demo-seconds="):
+            if arg == "--demo-seconds":
+                next(it, None)
+            continue
+        out.append(arg)
+    return out
+
+
+def remember_persistent_argv(argv: Optional[Sequence[str]] = None) -> None:
+    global _PERSISTENT_ARGV
+    raw = list(argv) if argv is not None else list(sys.argv[1:])
+    _PERSISTENT_ARGV = persistent_argv_from(raw)
+
+
+def _autostart_argument_string(script: Path) -> str:
+    parts = [f'"{script}"']
+    for a in _PERSISTENT_ARGV:
+        if any(ch.isspace() for ch in a):
+            parts.append(f'"{a}"')
+        else:
+            parts.append(a)
+    return " ".join(parts)
 
 
 def _startup_dir() -> Path:
@@ -525,11 +558,14 @@ def set_autostart_enabled(enabled: bool) -> bool:
             if candidate.is_file():
                 pythonw = candidate
         script = Path(__file__).resolve()
+        args_str = _autostart_argument_string(script)
         # Create .lnk via PowerShell for consistency with Explorer Startup
+        # Escape for PowerShell single-quoted string: ' -> ''
+        ps_args = args_str.replace("'", "''")
         ps = (
             f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut(\"{lnk}\"); "
             f"$s.TargetPath = \"{pythonw}\"; "
-            f"$s.Arguments = '\"{script}\"'; "
+            f"$s.Arguments = '{ps_args}'; "
             f"$s.WorkingDirectory = \"{script.parent}\"; "
             f"$s.WindowStyle = 7; "
             f"$s.Description = '护眼锁屏助手 — 登录后自动启动'; "
@@ -554,7 +590,7 @@ def set_autostart_enabled(enabled: bool) -> bool:
 
         bat.write_text(
             "@echo off\r\n"
-            + f'start "" "{pythonw}" "{script}"\r\n',
+            + f'start "" "{pythonw}" {args_str}\r\n',
             encoding="utf-8",
         )
         LOG.info("已开启开机自启: %s", bat)
@@ -929,7 +965,14 @@ class TrayIcon:
                 if cmd == ID_TRAY_BREAK:
                     self.on_break()
                 elif cmd == ID_TRAY_AUTOSTART:
-                    set_autostart_enabled(not is_autostart_enabled())
+                    want = not is_autostart_enabled()
+                    if not set_autostart_enabled(want):
+                        user32.MessageBoxW(
+                            hwnd,
+                            "无法修改开机自启。\n请检查 Startup 目录权限后重试。",
+                            APP_NAME,
+                            0x10,  # MB_ICONERROR
+                        )
                 elif cmd == ID_TRAY_ABOUT:
                     user32.MessageBoxW(
                         hwnd,
@@ -1348,7 +1391,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
+    raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    remember_persistent_argv(raw_argv)
+    args = parse_args(raw_argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
