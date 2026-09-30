@@ -341,12 +341,12 @@ def _macos_dialog_script(title: str, message: str, button: str = "好") -> str:
 
 
 def _macos_show_dialog_detached(title: str, message: str, button: str = "好") -> bool:
-    """Show an About/info dialog via detached osascript.
+    """Show an info dialog via detached osascript (NOT for About menu).
 
-    Do NOT call NSAlert.runModal or tkinter.messagebox from the status-item
-    menu path: under launchd + Tk + AppKit they share NSApplication and can
-    abort the Python process (PyEval_RestoreThread / Abort trap 6).
-    A separate osascript process owns the modal dialog and cannot kill us.
+    Prefer `_macos_show_about_external` for the status-item About action:
+    scheduling Tk `after` from an AppKit menu callback still aborts
+    (PyEval_RestoreThread in AfterProc) even when the dialog itself is
+    out-of-process. Keep this helper only for rare non-About errors.
     """
     if not IS_MAC:
         return False
@@ -363,6 +363,59 @@ def _macos_show_dialog_detached(title: str, message: str, button: str = "好") -
         return True
     except Exception:  # noqa: BLE001
         LOG.debug("osascript display dialog 启动失败", exc_info=True)
+        return False
+
+
+def _macos_about_body() -> str:
+    return (
+        f"{APP_NAME}\n"
+        "================\n\n"
+        "定时全屏护眼提醒。\n"
+        "默认每 20 分钟休息 20 秒。\n"
+        "配置见同目录 config.json。\n\n"
+        "macOS：点击菜单栏剩余分钟数字打开菜单；\n"
+        "也可右键（或 Control+点击）悬浮倒计时 HUD。\n\n"
+        "菜单项：立即开始休息 / 开机自动启动 / 关于 / 退出。\n"
+    )
+
+
+def _macos_show_about_external() -> bool:
+    """Show About with ZERO Tk / AppKit modal involvement.
+
+    Writes a small text file and `open`s it in a new process. Safe to call
+    directly from an NSStatusItem menu action (do not route through
+    root.after / _on_main — that path hits Tk AfterProc and aborts with
+    SIGABRT / PyEval_RestoreThread under Tk+AppKit+launchd).
+    """
+    if not IS_MAC:
+        return False
+    body = _macos_about_body()
+    path = APP_DIR / "ABOUT.txt"
+    try:
+        path.write_text(body, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        try:
+            path = Path.home() / "Library" / "Logs" / "eye-care-lock-ABOUT.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            LOG.debug("写入关于文本失败", exc_info=True)
+            return False
+    try:
+        # `open` hands the file to LaunchServices / TextEdit — never touches
+        # our NSApplication or Tk event loop.
+        subprocess.Popen(
+            ["open", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        LOG.info("关于：已用系统打开 %s", path)
+        return True
+    except Exception:  # noqa: BLE001
+        LOG.debug("open 关于文本失败", exc_info=True)
         return False
 
 
@@ -1549,7 +1602,15 @@ class MacStatusUI:
                 ui._on_main(ui._toggle_autostart)
 
             def doAbout_(self, _sender):  # noqa: N802, ANN001
-                ui._on_main(ui._show_about)
+                # NEVER schedule About onto Tk via root.after / _on_main.
+                # Crash report PID 34961: AfterProc → PyEval_RestoreThread → SIGABRT.
+                # Only spawn an external viewer; no Tk widgets, no AppKit modal.
+                try:
+                    LOG.info("菜单栏「关于」：外部打开 ABOUT.txt（绕过 Tk）")
+                    if not _macos_show_about_external():
+                        LOG.info("关于：定时全屏护眼提醒，见 config.json")
+                except Exception:  # noqa: BLE001
+                    LOG.exception("菜单栏「关于」失败")
 
             def doExit_(self, _sender):  # noqa: N802, ANN001
                 ui._on_main(ui.on_exit)
@@ -1866,20 +1927,11 @@ class MacStatusUI:
             pass
 
     def _show_about(self) -> None:
-        msg = (
-            "定时全屏护眼提醒。\n"
-            "默认每 20 分钟休息 20 秒。\n"
-            "配置见 config.json。\n\n"
-            "macOS：菜单栏图标或右键悬浮倒计时打开菜单。"
-        )
-        LOG.info("关于：定时全屏护眼提醒，见 config.json")
-        self._flash_menu_status("关于：已弹出系统对话框")
-        # 切勿对共享 NSApp 调 NSAlert.runModal / tkinter.messagebox：
-        # launchd + Tk + AppKit 下会 abort（GIL / Abort trap 6）。
-        if IS_MAC and _macos_show_dialog_detached(APP_NAME, msg):
+        """About from HUD Tk menu — still must not flash via AppKit+Tk after."""
+        LOG.info("HUD「关于」：外部打开 ABOUT.txt（不碰 messagebox / NSAlert / after）")
+        if IS_MAC and _macos_show_about_external():
             return
-        # 非 macOS 或 osascript 不可用时仅记日志，不阻塞进程
-        LOG.info("关于内容：%s", msg.replace("\n", " | "))
+        LOG.info("关于：定时全屏护眼提醒，见 config.json")
 
     def _toggle_autostart(self) -> None:
         want = not is_autostart_enabled()
