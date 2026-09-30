@@ -1,8 +1,8 @@
 """
-护眼锁屏助手 — Windows 定时全屏休息提醒。
+护眼锁屏助手 — Windows / macOS 定时全屏休息提醒。
 
-仅使用 Python 标准库（tkinter + ctypes），无需 pip 安装。
-目标系统：Windows 10+ / Windows Server 2022，Python 3.11+。
+仅使用 Python 标准库（tkinter + ctypes + subprocess），无需 pip 安装。
+目标系统：Windows 10+ / Windows Server 2022，macOS 12+（Apple Silicon / Intel），Python 3.11+。
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -24,16 +25,25 @@ from typing import Callable, List, Optional, Sequence, Tuple
 # 平台检测
 # ---------------------------------------------------------------------------
 IS_WINDOWS = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
 
 try:
     import tkinter as tk
     from tkinter import font as tkfont
 except ImportError as exc:  # pragma: no cover
-    print("错误：无法导入 tkinter。请安装带 Tcl/Tk 的 Python（官方 Windows 安装包通常已包含）。", file=sys.stderr)
+    hint = (
+        "官方 Windows 安装包通常已包含"
+        if IS_WINDOWS
+        else "macOS 可用 python.org 安装包或 Homebrew python-tk"
+        if IS_MAC
+        else "请安装带 Tcl/Tk 的 Python"
+    )
+    print(f"错误：无法导入 tkinter。{hint}。", file=sys.stderr)
     raise SystemExit(1) from exc
 
+import ctypes
+
 if IS_WINDOWS:
-    import ctypes
     from ctypes import wintypes
 
 
@@ -152,17 +162,74 @@ def load_config(path: Path) -> Config:
 MonitorRect = Tuple[int, int, int, int]  # left, top, right, bottom
 
 
-def get_monitors() -> List[MonitorRect]:
-    """返回所有显示器的虚拟桌面坐标；失败时至少返回主屏。"""
-    if not IS_WINDOWS:
-        # 非 Windows：用 tkinter 探测主屏尺寸（开发/冒烟用）
-        root = tk.Tk()
-        root.withdraw()
+def _primary_monitor_tk() -> List[MonitorRect]:
+    """用 tkinter 探测主屏尺寸（回退路径）。"""
+    root = tk.Tk()
+    root.withdraw()
+    try:
         w = root.winfo_screenwidth()
         h = root.winfo_screenheight()
+    finally:
         root.destroy()
-        return [(0, 0, w, h)]
+    return [(0, 0, w, h)]
 
+
+def _get_monitors_mac() -> List[MonitorRect]:
+    """通过 CoreGraphics/Quartz 枚举显示器；坐标转为 tk 常用的左上原点。"""
+    try:
+        cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+
+        class CGPoint(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+        class CGSize(ctypes.Structure):
+            _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+        class CGRect(ctypes.Structure):
+            _fields_ = [("origin", CGPoint), ("size", CGSize)]
+
+        CGDirectDisplayID = ctypes.c_uint32
+        max_displays = 32
+        display_count = ctypes.c_uint32(0)
+        displays = (CGDirectDisplayID * max_displays)()
+
+        cg.CGGetActiveDisplayList.argtypes = [
+            ctypes.c_uint32,
+            ctypes.POINTER(CGDirectDisplayID),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        cg.CGGetActiveDisplayList.restype = ctypes.c_int32
+        cg.CGMainDisplayID.argtypes = []
+        cg.CGMainDisplayID.restype = CGDirectDisplayID
+        cg.CGDisplayBounds.argtypes = [CGDirectDisplayID]
+        cg.CGDisplayBounds.restype = CGRect
+
+        err = cg.CGGetActiveDisplayList(max_displays, displays, ctypes.byref(display_count))
+        if err != 0 or display_count.value == 0:
+            raise RuntimeError(f"CGGetActiveDisplayList err={err}")
+
+        main_bounds = cg.CGDisplayBounds(cg.CGMainDisplayID())
+        main_height = float(main_bounds.size.height)
+        monitors: List[MonitorRect] = []
+        for i in range(int(display_count.value)):
+            b = cg.CGDisplayBounds(displays[i])
+            # Quartz：原点在主屏左下，y 向上；tk：原点主屏左上，y 向下
+            left = int(round(b.origin.x))
+            top = int(round(main_height - (b.origin.y + b.size.height)))
+            right = int(round(b.origin.x + b.size.width))
+            bottom = int(round(main_height - b.origin.y))
+            if right > left and bottom > top:
+                monitors.append((left, top, right, bottom))
+        if monitors:
+            return monitors
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("macOS 多显示器枚举失败，回退主屏：%s", exc)
+    return _primary_monitor_tk()
+
+
+def _get_monitors_windows() -> List[MonitorRect]:
     user32 = ctypes.windll.user32
     monitors: List[MonitorRect] = []
 
@@ -206,15 +273,46 @@ def get_monitors() -> List[MonitorRect]:
     return monitors
 
 
+def get_monitors() -> List[MonitorRect]:
+    """返回所有显示器的虚拟桌面坐标；失败时至少返回主屏。"""
+    if IS_WINDOWS:
+        return _get_monitors_windows()
+    if IS_MAC:
+        return _get_monitors_mac()
+    return _primary_monitor_tk()
+
+
 def lock_workstation() -> None:
-    """调用 Windows LockWorkStation（需用户会话，无需管理员）。"""
-    if not IS_WINDOWS:
-        LOG.warning("当前非 Windows，跳过 LockWorkStation。")
+    """锁屏：Windows 用 LockWorkStation；macOS 用 Control+Command+Q（需辅助功能权限）。"""
+    if IS_WINDOWS:
+        try:
+            ctypes.windll.user32.LockWorkStation()
+        except Exception:  # noqa: BLE001
+            LOG.exception("LockWorkStation 调用失败")
         return
-    try:
-        ctypes.windll.user32.LockWorkStation()
-    except Exception:  # noqa: BLE001
-        LOG.exception("LockWorkStation 调用失败")
+    if IS_MAC:
+        try:
+            # 等价于菜单「锁定屏幕」快捷键；可能需在「系统设置 → 隐私与安全性 → 辅助功能」授权终端/Python
+            r = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "System Events" to keystroke "q" using {control down, command down}',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if r.returncode != 0:
+                LOG.warning(
+                    "macOS 锁屏失败（returncode=%s）：%s",
+                    r.returncode,
+                    (r.stderr or r.stdout or "").strip()[:200],
+                )
+        except Exception:  # noqa: BLE001
+            LOG.exception("macOS 锁屏（osascript）调用失败")
+        return
+    LOG.warning("当前平台不支持 lock_workstation，已跳过。")
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +362,19 @@ class BreakOverlay:
 
     def _pick_font(self, size: int, bold: bool = False) -> tuple:
         families = set(tkfont.families(self.root))
-        for name in ("Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑", "SimHei", "Noto Sans CJK SC", "WenQuanYi Micro Hei"):
+        candidates = (
+            "PingFang SC",
+            "Hiragino Sans GB",
+            "Heiti SC",
+            "STHeiti",
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "微软雅黑",
+            "SimHei",
+            "Noto Sans CJK SC",
+            "WenQuanYi Micro Hei",
+        )
+        for name in candidates:
             if name in families:
                 return (name, size, "bold" if bold else "normal")
         return ("TkDefaultFont", size, "bold" if bold else "normal")
@@ -476,9 +586,10 @@ class BreakOverlay:
 
 
 # ---------------------------------------------------------------------------
-# 开机自启（当前用户 Startup 目录）
+# 开机自启（Windows Startup / macOS LaunchAgent）
 # ---------------------------------------------------------------------------
 AUTOSTART_NAME = "护眼锁屏助手"
+MAC_LAUNCH_AGENT_LABEL = "net.chinadong.eye-care"
 # 当前进程用于开机自启的持久参数（不含 --once / --demo-seconds 等临时项）
 _PERSISTENT_ARGV: List[str] = []
 
@@ -514,6 +625,16 @@ def _autostart_argument_string(script: Path) -> str:
     return " ".join(parts)
 
 
+def _python_for_autostart() -> Path:
+    """选择适合后台自启的解释器路径。"""
+    exe = Path(sys.executable)
+    if IS_WINDOWS and exe.name.lower() == "python.exe":
+        candidate = exe.with_name("pythonw.exe")
+        if candidate.is_file():
+            return candidate
+    return exe
+
+
 def _startup_dir() -> Path:
     appdata = os.environ.get("APPDATA")
     if not appdata:
@@ -526,75 +647,188 @@ def autostart_candidates() -> List[Path]:
     return [d / f"{AUTOSTART_NAME}.lnk", d / f"{AUTOSTART_NAME}.bat"]
 
 
-def is_autostart_enabled() -> bool:
-    if not IS_WINDOWS:
-        return False
+def _mac_launch_agents_dir() -> Path:
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def _mac_plist_path() -> Path:
+    return _mac_launch_agents_dir() / f"{MAC_LAUNCH_AGENT_LABEL}.plist"
+
+
+def _xml_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _build_mac_plist(python: Path, script: Path) -> str:
+    args = [str(python), str(script), *_PERSISTENT_ARGV]
+    arg_xml = "\n".join(f"        <string>{_xml_escape(a)}</string>" for a in args)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        "<dict>\n"
+        "    <key>Label</key>\n"
+        f"    <string>{MAC_LAUNCH_AGENT_LABEL}</string>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        f"{arg_xml}\n"
+        "    </array>\n"
+        "    <key>WorkingDirectory</key>\n"
+        f"    <string>{_xml_escape(str(script.parent))}</string>\n"
+        "    <key>RunAtLoad</key>\n"
+        "    <true/>\n"
+        "    <key>KeepAlive</key>\n"
+        "    <false/>\n"
+        "    <key>ProcessType</key>\n"
+        "    <string>Interactive</string>\n"
+        "</dict>\n"
+        "</plist>\n"
+    )
+
+
+def _mac_launchctl(action: str, plist: Path) -> None:
+    """best-effort load/unload；失败只记日志。"""
+    uid = os.getuid()
+    domain = f"gui/{uid}"
     try:
-        return any(p.is_file() for p in autostart_candidates())
+        if action == "bootout":
+            subprocess.run(
+                ["launchctl", "bootout", domain, str(plist)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        elif action == "bootstrap":
+            subprocess.run(
+                ["launchctl", "bootstrap", domain, str(plist)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        elif action == "unload":
+            subprocess.run(
+                ["launchctl", "unload", str(plist)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        elif action == "load":
+            subprocess.run(
+                ["launchctl", "load", str(plist)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("launchctl %s 失败: %s", action, exc)
+
+
+def is_autostart_enabled() -> bool:
+    try:
+        if IS_WINDOWS:
+            return any(p.is_file() for p in autostart_candidates())
+        if IS_MAC:
+            return _mac_plist_path().is_file()
     except Exception:  # noqa: BLE001
         return False
+    return False
+
+
+def _set_autostart_windows(enabled: bool) -> bool:
+    startup = _startup_dir()
+    startup.mkdir(parents=True, exist_ok=True)
+    lnk = startup / f"{AUTOSTART_NAME}.lnk"
+    bat = startup / f"{AUTOSTART_NAME}.bat"
+    if not enabled:
+        for p in (lnk, bat):
+            if p.is_file():
+                p.unlink()
+        LOG.info("已关闭开机自启")
+        return True
+
+    pythonw = _python_for_autostart()
+    script = Path(__file__).resolve()
+    args_str = _autostart_argument_string(script)
+    ps_args = args_str.replace("'", "''")
+    ps = (
+        f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut(\"{lnk}\"); "
+        f"$s.TargetPath = \"{pythonw}\"; "
+        f"$s.Arguments = '{ps_args}'; "
+        f"$s.WorkingDirectory = \"{script.parent}\"; "
+        f"$s.WindowStyle = 7; "
+        f"$s.Description = '护眼锁屏助手 — 登录后自动启动'; "
+        f"$s.Save()"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode == 0 and lnk.is_file():
+            if bat.is_file():
+                bat.unlink()
+            LOG.info("已开启开机自启: %s", lnk)
+            return True
+        LOG.warning("创建快捷方式失败，改用 bat: %s", (r.stderr or r.stdout)[:200])
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("创建快捷方式异常，改用 bat: %s", exc)
+
+    bat.write_text(
+        "@echo off\r\n"
+        + f'start "" "{pythonw}" {args_str}\r\n',
+        encoding="utf-8",
+    )
+    LOG.info("已开启开机自启: %s", bat)
+    return True
+
+
+def _set_autostart_mac(enabled: bool) -> bool:
+    agents = _mac_launch_agents_dir()
+    agents.mkdir(parents=True, exist_ok=True)
+    plist = _mac_plist_path()
+    if not enabled:
+        if plist.is_file():
+            _mac_launchctl("bootout", plist)
+            _mac_launchctl("unload", plist)
+            try:
+                plist.unlink()
+            except OSError as exc:
+                LOG.error("删除 LaunchAgent 失败: %s", exc)
+                return False
+        LOG.info("已关闭开机自启（LaunchAgent）")
+        return True
+
+    python = _python_for_autostart()
+    script = Path(__file__).resolve()
+    body = _build_mac_plist(python, script)
+    # 先卸再写，避免残留旧定义
+    if plist.is_file():
+        _mac_launchctl("bootout", plist)
+        _mac_launchctl("unload", plist)
+    plist.write_text(body, encoding="utf-8")
+    _mac_launchctl("bootstrap", plist)
+    _mac_launchctl("load", plist)
+    LOG.info("已开启开机自启: %s", plist)
+    return True
 
 
 def set_autostart_enabled(enabled: bool) -> bool:
     """启用/关闭登录自启。成功返回 True。"""
-    if not IS_WINDOWS:
-        return False
     try:
-        startup = _startup_dir()
-        startup.mkdir(parents=True, exist_ok=True)
-        lnk = startup / f"{AUTOSTART_NAME}.lnk"
-        bat = startup / f"{AUTOSTART_NAME}.bat"
-        if not enabled:
-            for p in (lnk, bat):
-                if p.is_file():
-                    p.unlink()
-            LOG.info("已关闭开机自启")
-            return True
-
-        pythonw = Path(sys.executable)
-        # Prefer pythonw.exe alongside python.exe
-        if pythonw.name.lower() == "python.exe":
-            candidate = pythonw.with_name("pythonw.exe")
-            if candidate.is_file():
-                pythonw = candidate
-        script = Path(__file__).resolve()
-        args_str = _autostart_argument_string(script)
-        # Create .lnk via PowerShell for consistency with Explorer Startup
-        # Escape for PowerShell single-quoted string: ' -> ''
-        ps_args = args_str.replace("'", "''")
-        ps = (
-            f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut(\"{lnk}\"); "
-            f"$s.TargetPath = \"{pythonw}\"; "
-            f"$s.Arguments = '{ps_args}'; "
-            f"$s.WorkingDirectory = \"{script.parent}\"; "
-            f"$s.WindowStyle = 7; "
-            f"$s.Description = '护眼锁屏助手 — 登录后自动启动'; "
-            f"$s.Save()"
-        )
-        # Use bat fallback if PowerShell fails
-        try:
-            r = __import__("subprocess").run(
-                ["powershell", "-NoProfile", "-Command", ps],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if r.returncode == 0 and lnk.is_file():
-                if bat.is_file():
-                    bat.unlink()
-                LOG.info("已开启开机自启: %s", lnk)
-                return True
-            LOG.warning("创建快捷方式失败，改用 bat: %s", (r.stderr or r.stdout)[:200])
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("创建快捷方式异常，改用 bat: %s", exc)
-
-        bat.write_text(
-            "@echo off\r\n"
-            + f'start "" "{pythonw}" {args_str}\r\n',
-            encoding="utf-8",
-        )
-        LOG.info("已开启开机自启: %s", bat)
-        return True
+        if IS_WINDOWS:
+            return _set_autostart_windows(enabled)
+        if IS_MAC:
+            return _set_autostart_mac(enabled)
+        LOG.warning("当前平台不支持开机自启切换")
+        return False
     except Exception as exc:  # noqa: BLE001
         LOG.error("配置开机自启失败: %s", exc)
         return False
@@ -1091,6 +1325,91 @@ class TrayIcon:
 
 
 # ---------------------------------------------------------------------------
+# macOS 状态 UI（无第三方菜单栏依赖：HUD 右键菜单）
+# ---------------------------------------------------------------------------
+class MacStatusUI:
+    """与 TrayIcon 对齐的 start/stop/set_status API；菜单挂在 CountdownHud 上。"""
+
+    def __init__(
+        self,
+        on_break: Callable[[], None],
+        on_exit: Callable[[], None],
+        tooltip: str = APP_NAME,
+    ) -> None:
+        self.on_break = on_break
+        self.on_exit = on_exit
+        self.tooltip = tooltip
+        self.status_label = tooltip
+        self._hud: Optional["CountdownHud"] = None
+        self._running = False
+
+    def attach_hud(self, hud: "CountdownHud") -> None:
+        self._hud = hud
+        hud.bind_status_menu(
+            on_break=self.on_break,
+            on_exit=self.on_exit,
+            on_about=self._show_about,
+            on_toggle_autostart=self._toggle_autostart,
+            get_status_label=lambda: self.status_label,
+            get_autostart=is_autostart_enabled,
+        )
+
+    def start(self) -> None:
+        self._running = True
+        LOG.info(
+            "macOS：无系统托盘时使用悬浮 HUD — 右键（或 Control+点击）打开菜单"
+            "（立即休息 / 开机自启 / 关于 / 退出）。"
+        )
+
+    def stop(self) -> None:
+        self._running = False
+
+    def set_status(
+        self,
+        tip: str,
+        menu_label: Optional[str] = None,
+        minutes: Optional[int] = None,
+        resting: bool = False,
+    ) -> None:
+        self.tooltip = tip
+        if menu_label is not None:
+            self.status_label = menu_label
+        # minutes/resting 由 HUD.update 单独刷新；此处仅同步 tip/菜单状态行
+        _ = (minutes, resting)
+
+    @staticmethod
+    def _show_about() -> None:
+        try:
+            from tkinter import messagebox
+
+            messagebox.showinfo(
+                APP_NAME,
+                "定时全屏护眼提醒。\n"
+                "默认每 20 分钟休息 20 秒。\n"
+                "配置见 config.json。\n\n"
+                "macOS：右键悬浮倒计时打开菜单。",
+            )
+        except Exception:  # noqa: BLE001
+            LOG.info("关于：定时全屏护眼提醒，见 config.json")
+
+    @staticmethod
+    def _toggle_autostart() -> None:
+        want = not is_autostart_enabled()
+        if not set_autostart_enabled(want):
+            try:
+                from tkinter import messagebox
+
+                messagebox.showerror(
+                    APP_NAME,
+                    "无法修改开机自启。\n请检查 ~/Library/LaunchAgents 权限后重试。",
+                )
+            except Exception:  # noqa: BLE001
+                LOG.error("无法修改开机自启")
+
+
+
+
+# ---------------------------------------------------------------------------
 # 屏幕常显倒计时 HUD（护眼色）
 # ---------------------------------------------------------------------------
 class CountdownHud:
@@ -1112,13 +1431,25 @@ class CountdownHud:
         self.win.configure(bg="#2F4F3E")
         self._drag_x = 0
         self._drag_y = 0
+        self._menu_on_break: Optional[Callable[[], None]] = None
+        self._menu_on_exit: Optional[Callable[[], None]] = None
+        self._menu_on_about: Optional[Callable[[], None]] = None
+        self._menu_on_toggle_autostart: Optional[Callable[[], None]] = None
+        self._menu_get_status: Optional[Callable[[], str]] = None
+        self._menu_get_autostart: Optional[Callable[[], bool]] = None
+        self._press_x_root = 0
+        self._press_y_root = 0
+        self._dragging = False
+
+        num_font = ("PingFang SC", 28, "bold") if IS_MAC else ("Segoe UI", 28, "bold")
+        unit_font = ("PingFang SC", 9) if IS_MAC else ("Microsoft YaHei UI", 9)
 
         self.frame = tk.Frame(self.win, bg="#2F4F3E", padx=14, pady=10)
         self.frame.pack(fill="both", expand=True)
         self.lbl_num = tk.Label(
             self.frame,
             text="--",
-            font=("Segoe UI", 28, "bold"),
+            font=num_font,
             fg="#C8E6C9",
             bg="#2F4F3E",
         )
@@ -1126,7 +1457,7 @@ class CountdownHud:
         self.lbl_unit = tk.Label(
             self.frame,
             text="分钟后休息",
-            font=("Microsoft YaHei UI", 9),
+            font=unit_font,
             fg="#A5D6A7",
             bg="#2F4F3E",
         )
@@ -1135,9 +1466,32 @@ class CountdownHud:
         for w in (self.win, self.frame, self.lbl_num, self.lbl_unit):
             w.bind("<ButtonPress-1>", self._start_drag)
             w.bind("<B1-Motion>", self._on_drag)
+            w.bind("<ButtonRelease-1>", self._end_drag)
+            w.bind("<Button-3>", self._on_context_menu)
+            w.bind("<Control-Button-1>", self._on_context_menu)
+            if IS_MAC:
+                # macOS tk 常把右键映射为 Button-2
+                w.bind("<Button-2>", self._on_context_menu)
 
         self.win.update_idletasks()
         self._place_bottom_right()
+
+    def bind_status_menu(
+        self,
+        on_break: Callable[[], None],
+        on_exit: Callable[[], None],
+        on_about: Callable[[], None],
+        on_toggle_autostart: Callable[[], None],
+        get_status_label: Callable[[], str],
+        get_autostart: Callable[[], bool],
+    ) -> None:
+        """绑定状态菜单（托盘之外的备用入口；macOS 主入口）。"""
+        self._menu_on_break = on_break
+        self._menu_on_exit = on_exit
+        self._menu_on_about = on_about
+        self._menu_on_toggle_autostart = on_toggle_autostart
+        self._menu_get_status = get_status_label
+        self._menu_get_autostart = get_autostart
 
     def _place_bottom_right(self) -> None:
         self.win.update_idletasks()
@@ -1152,9 +1506,41 @@ class CountdownHud:
     def _start_drag(self, event) -> None:  # noqa: ANN001
         self._drag_x = event.x_root - self.win.winfo_x()
         self._drag_y = event.y_root - self.win.winfo_y()
+        self._press_x_root = event.x_root
+        self._press_y_root = event.y_root
+        self._dragging = False
 
     def _on_drag(self, event) -> None:  # noqa: ANN001
+        if abs(event.x_root - self._press_x_root) > 4 or abs(event.y_root - self._press_y_root) > 4:
+            self._dragging = True
         self.win.geometry(f"+{event.x_root - self._drag_x}+{event.y_root - self._drag_y}")
+
+    def _end_drag(self, event) -> None:  # noqa: ANN001
+        # 预留：左键短按不弹菜单，避免与拖动冲突；菜单用右键 / Control+点击
+        _ = event
+
+    def _on_context_menu(self, event) -> str:  # noqa: ANN001
+        if self._menu_on_break is None:
+            return "break"
+        menu = tk.Menu(self.win, tearoff=0)
+        status = self._menu_get_status() if self._menu_get_status else APP_NAME
+        menu.add_command(label=status[:64], state="disabled")
+        menu.add_separator()
+        menu.add_command(label="立即开始休息", command=self._menu_on_break)
+        auto_on = bool(self._menu_get_autostart() if self._menu_get_autostart else False)
+        auto_label = "开机自动启动 ✓" if auto_on else "开机自动启动"
+        menu.add_command(label=auto_label, command=self._menu_on_toggle_autostart)
+        menu.add_command(label="关于", command=self._menu_on_about)
+        menu.add_separator()
+        menu.add_command(label="退出", command=self._menu_on_exit)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:  # noqa: BLE001
+                pass
+        return "break"
 
     def _apply_colors(self, bg: str, fg: str) -> None:
         for w in (self.win, self.frame, self.lbl_num, self.lbl_unit):
@@ -1214,13 +1600,64 @@ class EyeCareApp:
         self._next_break_at = time.monotonic() + config.interval_minutes * 60
         self._scheduler_job: Optional[str] = None
 
-        self.tray = TrayIcon(
-            on_break=lambda: self.root.after(0, self.start_break),
-            on_exit=lambda: self.root.after(0, self.request_exit),
-            tooltip=f"{APP_NAME}（间隔 {config.interval_minutes:g} 分钟）",
-        )
+        on_break = lambda: self.root.after(0, self.start_break)
+        on_exit = lambda: self.root.after(0, self.request_exit)
+        tip = f"{APP_NAME}（间隔 {config.interval_minutes:g} 分钟）"
+        if IS_WINDOWS:
+            self.tray = TrayIcon(on_break=on_break, on_exit=on_exit, tooltip=tip)
+        else:
+            # macOS / 其它：MacStatusUI（HUD 菜单）；保持与 TrayIcon 相同的 start/stop/set_status
+            self.tray = MacStatusUI(on_break=on_break, on_exit=on_exit, tooltip=tip)
         self.hud = CountdownHud(self.root)
+        self._wire_hud_menu()
         atexit.register(self._cleanup)
+
+    def _wire_hud_menu(self) -> None:
+        """HUD 右键菜单：macOS 主入口；Windows 作为托盘补充。"""
+        def on_about() -> None:
+            if IS_WINDOWS and isinstance(self.tray, TrayIcon):
+                try:
+                    ctypes.windll.user32.MessageBoxW(
+                        None,
+                        "定时全屏护眼提醒。\n默认每 20 分钟休息 20 秒。\n配置见 config.json。",
+                        APP_NAME,
+                        0,
+                    )
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                from tkinter import messagebox
+
+                messagebox.showinfo(
+                    APP_NAME,
+                    "定时全屏护眼提醒。\n默认每 20 分钟休息 20 秒。\n配置见 config.json。",
+                )
+            except Exception:  # noqa: BLE001
+                LOG.info("关于：见 config.json")
+
+        def on_toggle_autostart() -> None:
+            want = not is_autostart_enabled()
+            ok = set_autostart_enabled(want)
+            if not ok:
+                try:
+                    from tkinter import messagebox
+
+                    messagebox.showerror(APP_NAME, "无法修改开机自启，请检查权限后重试。")
+                except Exception:  # noqa: BLE001
+                    LOG.error("无法修改开机自启")
+
+        if isinstance(self.tray, MacStatusUI):
+            self.tray.attach_hud(self.hud)
+        else:
+            self.hud.bind_status_menu(
+                on_break=lambda: self.root.after(0, self.start_break),
+                on_exit=lambda: self.root.after(0, self.request_exit),
+                on_about=on_about,
+                on_toggle_autostart=on_toggle_autostart,
+                get_status_label=lambda: self.tray.status_label,
+                get_autostart=is_autostart_enabled,
+            )
 
     def run(self) -> None:
         interval_sec = self.config.interval_minutes * 60
@@ -1233,9 +1670,11 @@ class EyeCareApp:
             self.config.allow_skip,
         )
         if IS_WINDOWS:
-            LOG.info("系统托盘图标已启用：右键可「立即休息 / 退出」。")
+            LOG.info("系统托盘图标已启用：右键可「立即休息 / 开机自启 / 退出」；HUD 亦可右键。")
+        elif IS_MAC:
+            LOG.info("macOS：悬浮 HUD 右键（或 Control+点击）打开菜单。按 Ctrl+C 也可退出。")
         else:
-            LOG.info("演示模式（非 Windows）。按 Ctrl+C 退出。")
+            LOG.info("有限模式（非 Windows/macOS）。HUD 右键菜单可用；按 Ctrl+C 退出。")
 
         self.tray.start()
         self._schedule_check()
@@ -1338,7 +1777,7 @@ class EyeCareApp:
 # ---------------------------------------------------------------------------
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Windows 护眼锁屏助手：定时全屏遮罩提醒远眺休息。",
+        description="Windows / macOS 护眼锁屏助手：定时全屏遮罩提醒远眺休息。",
     )
     parser.add_argument(
         "-c",
@@ -1363,7 +1802,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--lock",
         action="store_true",
-        help="休息开始时调用 LockWorkStation（真正锁屏，需重新登录）",
+        help="休息开始时真正锁屏（Windows: LockWorkStation；macOS: Control+Command+Q）",
     )
     parser.add_argument(
         "--allow-skip",
