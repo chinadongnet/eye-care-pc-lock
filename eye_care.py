@@ -723,6 +723,8 @@ def _build_mac_plist(python: Path, script: Path) -> str:
         "    <false/>\n"
         "    <key>ProcessType</key>\n"
         "    <string>Interactive</string>\n"
+        "    <key>LimitLoadToSessionType</key>\n"
+        "    <string>Aqua</string>\n"
         "    <key>StandardOutPath</key>\n"
         f"    <string>{_xml_escape(str(log_path))}</string>\n"
         "    <key>StandardErrorPath</key>\n"
