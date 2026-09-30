@@ -2,7 +2,7 @@
 # 结束护眼锁屏助手进程（按命令行匹配 eye_care.py）
 # 用法: ./stop_eye_care.sh
 
-set -euo pipefail
+set -eo pipefail
 
 PIDS="$(pgrep -f "[e]ye_care.py" || true)"
 if [[ -z "$PIDS" ]]; then
