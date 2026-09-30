@@ -1347,11 +1347,8 @@ class MacStatusUI:
     同时保留悬浮 HUD 右键菜单。无 AppKit 时仅 HUD。
     """
 
-    # 与 TrayIcon / HUD 一致的护眼色 (R,G,B) — 菜单栏用前景色
-    COLOR_OK = (200, 230, 201)
-    COLOR_MID = (240, 230, 184)
-    COLOR_NEAR = (245, 208, 200)
-    COLOR_REST = (178, 223, 219)
+    # 菜单栏不用浅色护眼色（浅色菜单栏上几乎看不见）；
+    # 用系统 labelColor / template 图像，浅色与深色菜单栏皆清晰。
 
     def __init__(
         self,
@@ -1398,8 +1395,9 @@ class MacStatusUI:
                 self._start_menubar()
                 self._use_menubar = True
                 LOG.info(
-                    "macOS 菜单栏状态项已启用（剩余分钟 / 休息中）；"
-                    "点击图标打开菜单；悬浮 HUD 亦可右键。"
+                    "macOS 菜单栏状态项已启用：右上角显示剩余分钟数字"
+                    "（如 20）或休息中「休」；系统自动着色，点击打开菜单；"
+                    "悬浮 HUD 亦可右键。"
                 )
                 return
             except Exception:  # noqa: BLE001
@@ -1441,12 +1439,16 @@ class MacStatusUI:
             NSFont,
             NSFontAttributeName,
             NSForegroundColorAttributeName,
+            NSImage,
             NSMenu,
             NSMenuItem,
             NSObject,
             NSStatusBar,
+            NSImageOnly,
+            NSSquareStatusItemLength,
             NSVariableStatusItemLength,
         )
+        from Foundation import NSMakeRect, NSMakeSize  # noqa: WPS433
         ui = self
 
         class _MenuTarget(NSObject):
@@ -1496,13 +1498,18 @@ class MacStatusUI:
         exit_item.setTarget_(target)
         menu.addItem_(exit_item)
 
-        bar_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
-            NSVariableStatusItemLength
-        )
+        # 固定略宽于正方形，避免内容尚未绘制时长度为 0 / 被挤进溢出区
+        bar_item = NSStatusBar.systemStatusBar().statusItemWithLength_(28.0)
         button = bar_item.button()
         if button is not None:
             button.setToolTip_(self.tooltip)
+            # 先放明文标题，保证即便图像失败也立刻可见
+            button.setTitle_("20")
         bar_item.setMenu_(menu)
+        try:
+            bar_item.setVisible_(True)
+        except Exception:  # noqa: BLE001
+            pass
 
         # 强引用，防止 PyObjC 对象被 GC
         self._target = target
@@ -1514,6 +1521,12 @@ class MacStatusUI:
         self._NSAttributedString = NSAttributedString
         self._NSForegroundColorAttributeName = NSForegroundColorAttributeName
         self._NSFontAttributeName = NSFontAttributeName
+        self._NSImage = NSImage
+        self._NSMakeSize = NSMakeSize
+        self._NSMakeRect = NSMakeRect
+        self._NSSquareStatusItemLength = NSSquareStatusItemLength
+        self._NSVariableStatusItemLength = NSVariableStatusItemLength
+        self._NSImageOnly = NSImageOnly
 
         self._apply_menubar_status(self.tooltip, self._minutes if self._minutes is not None else 20, False)
         self._schedule_pump()
@@ -1574,16 +1587,56 @@ class MacStatusUI:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _fg_for(self, minutes: Optional[int], resting: bool) -> Tuple[int, int, int]:
+    def _menubar_title(self, minutes: Optional[int], resting: bool) -> str:
         if resting:
-            return self.COLOR_REST
+            return "休"
         if minutes is None:
-            return self.COLOR_OK
-        if minutes <= 5:
-            return self.COLOR_NEAR
-        if minutes <= 10:
-            return self.COLOR_MID
-        return self.COLOR_OK
+            return "·"
+        title = str(max(0, int(minutes)))
+        if len(title) > 2:
+            return "99"
+        return title
+
+    def _make_template_status_image(self, title: str):
+        """黑+透明 template 图：系统按菜单栏外观自动反色，浅/深皆清晰。"""
+        NSImage = self._NSImage
+        NSMakeSize = self._NSMakeSize
+        NSMakeRect = self._NSMakeRect
+        NSFont = self._NSFont
+        NSColor = self._NSColor
+        NSAttributedString = self._NSAttributedString
+        fg_attr = self._NSForegroundColorAttributeName
+        font_attr = self._NSFontAttributeName
+
+        # 菜单栏标准高度约 22pt；略宽以容纳两位数
+        w, h = (26.0, 22.0) if len(title) >= 2 else (22.0, 22.0)
+        size = NSMakeSize(w, h)
+        img = NSImage.alloc().initWithSize_(size)
+        img.lockFocus()
+        try:
+            # template 图像必须以黑色绘制；透明处不着色
+            # 数字用等宽数字字体；「休」等用系统字体以免缺字
+            if title.isdigit():
+                font = NSFont.monospacedDigitSystemFontOfSize_weight_(13.0, 0.5)
+            else:
+                font = NSFont.systemFontOfSize_weight_(13.0, 0.5)
+            attrs = {
+                fg_attr: NSColor.blackColor(),
+                font_attr: font,
+            }
+            astr = NSAttributedString.alloc().initWithString_attributes_(title, attrs)
+            ts = astr.size()
+            x = max(0.0, (w - ts.width) / 2.0)
+            y = max(0.0, (h - ts.height) / 2.0 - 0.5)
+            astr.drawInRect_(NSMakeRect(x, y, ts.width, ts.height))
+        finally:
+            img.unlockFocus()
+        img.setTemplate_(True)
+        try:
+            img.setSize_(size)
+        except Exception:  # noqa: BLE001
+            pass
+        return img
 
     def _apply_menubar_status(
         self,
@@ -1594,14 +1647,7 @@ class MacStatusUI:
         item = self._status_item
         if item is None:
             return
-        if resting:
-            title = "休"
-        elif minutes is None:
-            title = "·"
-        else:
-            title = str(max(0, int(minutes)))
-            if len(title) > 2:
-                title = "99"
+        title = self._menubar_title(minutes, resting)
         key = (title, resting)
         button = item.button()
         if button is not None:
@@ -1613,24 +1659,63 @@ class MacStatusUI:
             return
         self._last_title_key = key
         if button is None:
-            return
-        r, g, b = self._fg_for(minutes, resting)
-        try:
-            color = self._NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                r / 255.0, g / 255.0, b / 255.0, 1.0
-            )
-            font = self._NSFont.monospacedDigitSystemFontOfSize_weight_(13.0, 0.4)
-            attrs = {
-                self._NSForegroundColorAttributeName: color,
-                self._NSFontAttributeName: font,
-            }
-            astr = self._NSAttributedString.alloc().initWithString_attributes_(title, attrs)
-            button.setAttributedTitle_(astr)
-        except Exception:  # noqa: BLE001
+            # 旧系统偶发无 button；尽量用 length + title API
             try:
-                button.setTitle_(title)
+                item.setLength_(28.0)
+                item.setTitle_(title)
             except Exception:  # noqa: BLE001
                 pass
+            return
+
+        # 1) 明文标题（高对比）— 即便图像失败也可见
+        try:
+            button.setTitle_(title)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 2) 优先 template 图像（系统自动适配浅/深菜单栏）
+        used_image = False
+        try:
+            img = self._make_template_status_image(title)
+            button.setImage_(img)
+            button.setImagePosition_(self._NSImageOnly)  # 只显示图标，避免与标题叠字
+            # 图像模式下清空标题，避免与图像叠字；图像失败时保留标题
+            button.setTitle_("")
+            used_image = True
+            # 按位数调整宽度，避免挤进 Control Center 溢出
+            item.setLength_(28.0 if len(title) >= 2 else 24.0)
+        except Exception:  # noqa: BLE001
+            LOG.debug("菜单栏 template 图像失败，回退标题", exc_info=True)
+            try:
+                button.setImage_(None)
+            except Exception:  # noqa: BLE001
+                pass
+
+        if not used_image:
+            # 3) labelColor 属性标题：跟随系统外观，浅/深皆清晰
+            try:
+                color = self._NSColor.labelColor()
+                font = self._NSFont.monospacedDigitSystemFontOfSize_weight_(13.0, 0.5)
+                attrs = {
+                    self._NSForegroundColorAttributeName: color,
+                    self._NSFontAttributeName: font,
+                }
+                astr = self._NSAttributedString.alloc().initWithString_attributes_(
+                    title, attrs
+                )
+                button.setAttributedTitle_(astr)
+            except Exception:  # noqa: BLE001
+                try:
+                    button.setTitle_(title)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                item.setLength_(self._NSVariableStatusItemLength)
+            except Exception:  # noqa: BLE001
+                try:
+                    item.setLength_(28.0)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _refresh_menu_items(self, menu) -> None:  # noqa: ANN001
         try:
