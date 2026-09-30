@@ -669,6 +669,7 @@ def _xml_escape(s: str) -> str:
 def _build_mac_plist(python: Path, script: Path) -> str:
     args = [str(python), str(script), *_PERSISTENT_ARGV]
     arg_xml = "\n".join(f"        <string>{_xml_escape(a)}</string>" for a in args)
+    log_path = script.parent / "eye_care.log"
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -689,6 +690,10 @@ def _build_mac_plist(python: Path, script: Path) -> str:
         "    <false/>\n"
         "    <key>ProcessType</key>\n"
         "    <string>Interactive</string>\n"
+        "    <key>StandardOutPath</key>\n"
+        f"    <string>{_xml_escape(str(log_path))}</string>\n"
+        "    <key>StandardErrorPath</key>\n"
+        f"    <string>{_xml_escape(str(log_path))}</string>\n"
         "</dict>\n"
         "</plist>\n"
     )

@@ -18,8 +18,8 @@ Windows / macOS 定时护眼工具：默认每 **20 分钟**弹出全屏置顶�
 | `start_eye_care.bat` | Windows 双击启动（后台） |
 | `start_eye_care.ps1` | Windows PowerShell 启动（可传参数） |
 | `stop_eye_care.ps1` | Windows 结束进程 |
-| `start_eye_care.sh` | macOS / Unix 启动（默认可后台） |
-| `stop_eye_care.sh` | macOS / Unix 结束进程 |
+| `start_eye_care.sh` | macOS：LaunchAgent 后台启动（无 Terminal）+ 登录自启；`--show-console` 前台 |
+| `stop_eye_care.sh` | macOS：bootout LaunchAgent + 结束进程；`--disable-autostart` 关闭自启 |
 | `start_eye_care.command` | macOS Finder 双击启动（显示控制台） |
 | `requirements.txt` | 说明：默认无强制依赖；可选 macOS AppKit |
 
@@ -53,14 +53,17 @@ python eye_care.py
 
 ```bash
 chmod +x start_eye_care.sh stop_eye_care.sh start_eye_care.command
+# 推荐：LaunchAgent 后台启动（无 Terminal 窗口，并写入登录自启）
 ./start_eye_care.sh
-# 或前台看日志：
+# 前台调试（当前终端）：
 ./start_eye_care.sh --show-console
 # 或直接：
 python3 eye_care.py
 ```
 
-也可在 Finder 中双击 `start_eye_care.command`。
+`./start_eye_care.sh` 默认通过 **LaunchAgent**（`net.chinadong.eye-care`）由 launchd 托管，**不弹出 Terminal**；与菜单「开机自动启动」共用同一 plist。
+
+也可在 Finder 中双击 `start_eye_care.command`（会打开终端窗口，仅适合调试）。
 
 启动后：
 
@@ -98,10 +101,11 @@ python3 eye_care.py --demo-seconds 10 --break-seconds 5 -v
 ### macOS
 
 1. **菜单栏图标 → 退出**（推荐；或 HUD 右键 → 退出）
-2. 控制台中 **Ctrl+C**
-3. `./stop_eye_care.sh`
+2. `./stop_eye_care.sh`（`launchctl bootout` + 结束残留进程；**默认保留**登录自启 plist）
+3. 关闭登录自启并停止：`./stop_eye_care.sh --disable-autostart`
+4. 控制台模式下 **Ctrl+C**
 
-退出时会关闭遮罩并清理托盘 / 菜单栏状态项 / HUD，避免残留置顶窗口。
+退出时会关闭遮罩并清理菜单栏状态项 / HUD，避免残留置顶窗口。
 
 ---
 
@@ -167,19 +171,21 @@ python3 eye_care.py -c /path/to/config.json
 
 ### macOS
 
-**菜单栏 / HUD 菜单**：勾选「开机自动启动」会写入用户 LaunchAgent：
+**推荐**：运行 `./start_eye_care.sh` 即写入并加载 LaunchAgent（后台运行 + 登录自启）。
 
-- 路径：`~/Library/LaunchAgents/net.chinadong.eye-care.plist`
-- Label：`net.chinadong.eye-care`
-- 同样保留持久 CLI 参数（排除 `--once` / `--demo-seconds` / verbose）
+**菜单栏 / HUD 菜单**：勾选「开机自动启动」会写入同一用户 LaunchAgent：
 
-也可手动放置上述 plist，或使用：
+| 项 | 值 |
+|----|----|
+| 路径 | `~/Library/LaunchAgents/net.chinadong.eye-care.plist` |
+| Label | `net.chinadong.eye-care` |
+| 启停 | `./start_eye_care.sh` / `./stop_eye_care.sh` |
+| 或 | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.chinadong.eye-care.plist` |
+| 或 | `launchctl bootout gui/$(id -u)/net.chinadong.eye-care` |
 
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.chinadong.eye-care.plist
-```
+同样保留持久 CLI 参数（排除 `--once` / `--demo-seconds` / verbose）。日志写入应用目录 `eye_care.log`。
 
-关闭时菜单会删除 plist 并尝试 `launchctl bootout/unload`。
+关闭自启：菜单取消勾选，或 `./stop_eye_care.sh --disable-autostart`（删除 plist 并 bootout）。
 
 ---
 
