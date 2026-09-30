@@ -657,6 +657,39 @@ def _mac_plist_path() -> Path:
     return _mac_launch_agents_dir() / f"{MAC_LAUNCH_AGENT_LABEL}.plist"
 
 
+def _mac_tcc_protected_roots() -> List[Path]:
+    home = Path.home()
+    return [home / "Desktop", home / "Documents", home / "Downloads"]
+
+
+def _mac_service_dir(script: Path) -> Path:
+    """LaunchAgent 运行目录：避开 Desktop/Documents/Downloads（TCC 会导致 posix_spawn EPERM）。"""
+    script = script.resolve()
+    for root in _mac_tcc_protected_roots():
+        try:
+            script.relative_to(root.resolve())
+        except ValueError:
+            continue
+        return Path.home() / "Library" / "Application Support" / "eye-care-lock"
+    return script.parent
+
+
+def _mac_sync_service_files(script: Path) -> Path:
+    """若脚本在 TCC 目录，同步到 Application Support 并返回服务端脚本路径。"""
+    script = script.resolve()
+    service_dir = _mac_service_dir(script)
+    if service_dir == script.parent:
+        return script
+    service_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+
+    for name in ("eye_care.py", "config.json"):
+        src = script.parent / name
+        if src.is_file():
+            shutil.copy2(src, service_dir / name)
+    return service_dir / "eye_care.py"
+
+
 def _xml_escape(s: str) -> str:
     return (
         s.replace("&", "&amp;")
@@ -814,7 +847,7 @@ def _set_autostart_mac(enabled: bool) -> bool:
         return True
 
     python = _python_for_autostart()
-    script = Path(__file__).resolve()
+    script = _mac_sync_service_files(Path(__file__).resolve())
     body = _build_mac_plist(python, script)
     # 先卸再写，避免残留旧定义
     if plist.is_file():

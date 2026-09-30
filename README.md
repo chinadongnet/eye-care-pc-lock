@@ -183,7 +183,9 @@ python3 eye_care.py -c /path/to/config.json
 | 或 | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.chinadong.eye-care.plist` |
 | 或 | `launchctl bootout gui/$(id -u)/net.chinadong.eye-care` |
 
-同样保留持久 CLI 参数（排除 `--once` / `--demo-seconds` / verbose）。日志写入应用目录 `eye_care.log`。
+同样保留持久 CLI 参数（排除 `--once` / `--demo-seconds` / verbose）。
+
+**注意（macOS TCC）**：若应用放在 `Desktop` / `Documents` / `Downloads`，LaunchAgent 无法直接读取该路径。`start_eye_care.sh` 与菜单「开机自动启动」会把 `eye_care.py` / `config.json` 同步到 `~/Library/Application Support/eye-care-lock/` 再由 launchd 运行（无 Terminal）。日志在该目录的 `eye_care.log`。
 
 关闭自启：菜单取消勾选，或 `./stop_eye_care.sh --disable-autostart`（删除 plist 并 bootout）。
 
