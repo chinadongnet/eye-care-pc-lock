@@ -3,7 +3,8 @@
 Windows / macOS 定时护眼工具：默认每 **20 分钟**弹出全屏置顶遮罩，提示按 **20-20-20** 法则远眺休息 **20 秒**，倒计时结束后自动关闭。
 
 - 运行环境：Windows 10+ / Windows Server 2022，或 macOS 12+（Apple Silicon / Intel），Python 3.11+（需 tkinter）
-- **无需管理员权限**，**无需 pip 安装**（仅标准库：`tkinter` + `ctypes` + `subprocess`）
+- **无需管理员权限**；默认**无需 pip**（标准库：`tkinter` + `ctypes` + `subprocess`）
+- macOS **菜单栏状态项**在已有 PyObjC AppKit 时自动启用（如 Anaconda）；否则仍用 HUD
 - 主交互方式：全屏遮罩（不必每次输入密码）；可选真正锁屏
 
 ---
@@ -20,7 +21,7 @@ Windows / macOS 定时护眼工具：默认每 **20 分钟**弹出全屏置顶�
 | `start_eye_care.sh` | macOS / Unix 启动（默认可后台） |
 | `stop_eye_care.sh` | macOS / Unix 结束进程 |
 | `start_eye_care.command` | macOS Finder 双击启动（显示控制台） |
-| `requirements.txt` | 说明：无第三方依赖 |
+| `requirements.txt` | 说明：默认无强制依赖；可选 macOS AppKit |
 
 ---
 
@@ -63,9 +64,10 @@ python3 eye_care.py
 
 启动后：
 
-- 屏幕右下角出现**悬浮倒计时 HUD**
-- **右键**（或 **Control+点击**）HUD：`立即开始休息` / `开机自动启动` / `关于` / `退出`
-- 默认路径**不依赖** `pip` / `rumps`；若你自行安装了 `rumps` 等第三方菜单栏库，可自行扩展，但本仓库默认不要求
+- 屏幕**右上角菜单栏**出现状态项（剩余分钟数字，或休息中显示「休」；护眼色前景）
+- 点击菜单栏图标：`立即开始休息` / `开机自动启动`（勾选） / `关于` / `退出`
+- 屏幕右下角仍保留**悬浮倒计时 HUD**；**右键**（或 **Control+点击**）HUD 可打开同一套菜单
+- 菜单栏依赖本机 Python 的 **PyObjC AppKit**（Anaconda 通常已有）。若没有 AppKit，程序仍运行，仅 HUD 菜单可用；可选 `pip install pyobjc-framework-Cocoa`
 
 ### 立即测一次遮罩（测完自动退出）
 
@@ -95,11 +97,11 @@ python3 eye_care.py --demo-seconds 10 --break-seconds 5 -v
 
 ### macOS
 
-1. **HUD 右键 → 退出**（推荐）
+1. **菜单栏图标 → 退出**（推荐；或 HUD 右键 → 退出）
 2. 控制台中 **Ctrl+C**
 3. `./stop_eye_care.sh`
 
-退出时会关闭遮罩并清理托盘 / HUD，避免残留置顶窗口。
+退出时会关闭遮罩并清理托盘 / 菜单栏状态项 / HUD，避免残留置顶窗口。
 
 ---
 
@@ -165,7 +167,7 @@ python3 eye_care.py -c /path/to/config.json
 
 ### macOS
 
-**HUD 菜单**：勾选「开机自动启动」会写入用户 LaunchAgent：
+**菜单栏 / HUD 菜单**：勾选「开机自动启动」会写入用户 LaunchAgent：
 
 - 路径：`~/Library/LaunchAgents/net.chinadong.eye-care.plist`
 - Label：`net.chinadong.eye-care`
@@ -191,7 +193,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.chinadong.eye-care.p
 
 ## 行为说明
 
-1. 启动后在后台计时（Windows 托盘 / macOS HUD）
+1. 启动后在后台计时（Windows 托盘 / macOS 菜单栏 + HUD）
 2. 到达间隔 → 全屏遮罩 + 中文护眼提示 + 倒计时
 3. 默认**不可提前关闭**；倒计时结束后约 1.5 秒自动关闭，也可点「我已休息好」
 4. 若开启 `allow_skip`，可点「跳过」并二次确认
@@ -215,10 +217,10 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/net.chinadong.eye-care.p
 使用 arm64 的 Python 3.12+（或 3.11+）并带 tkinter 即可；本程序无原生扩展、无 Rosetta 硬性要求。若 Homebrew Python 缺 Tk，安装 `python-tk` 或改用 python.org 安装包。
 
 **Q: 能否在 Linux 用？**  
-Linux 为有限模式（主屏遮罩 + HUD 菜单，无系统托盘 / 无锁屏 API）。完整支持面向 Windows 与 macOS。
+Linux 为有限模式（主屏遮罩 + HUD 菜单，无系统托盘 / 无锁屏 API）。完整支持面向 Windows 与 macOS（含菜单栏）。
 
-**Q: 想用 macOS 菜单栏图标？**  
-默认路径刻意保持 stdlib-only。若你自行 `pip install rumps`，可自行写薄封装调用本程序逻辑；官方默认仍是 `python3 eye_care.py` 零依赖。
+**Q: macOS 菜单栏图标不出现？**  
+需要当前解释器能 `import AppKit`（PyObjC）。Anaconda 一般已自带；否则 `pip install pyobjc-framework-Cocoa` 后重启应用。无 AppKit 时仍有右下角 HUD 右键菜单。菜单栏状态项**不需要**辅助功能权限。
 
 ---
 

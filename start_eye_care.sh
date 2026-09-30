@@ -11,12 +11,23 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 PYTHON=""
-if command -v python3 >/dev/null 2>&1; then
-  PYTHON="$(command -v python3)"
-elif command -v python >/dev/null 2>&1; then
-  PYTHON="$(command -v python)"
-else
-  echo "未找到 python3。请安装 Python 3.11+（建议 python.org 或 brew install python-tk）。" >&2
+# 优先选用带 tkinter +（可选）AppKit 的解释器，便于 macOS 菜单栏状态项
+for candidate in \
+  /opt/anaconda3/bin/python3 \
+  "$HOME/anaconda3/bin/python3" \
+  "$HOME/miniconda3/bin/python3" \
+  "$(command -v python3 2>/dev/null || true)" \
+  "$(command -v python 2>/dev/null || true)"
+do
+  if [[ -n "$candidate" && -x "$candidate" ]]; then
+    if "$candidate" -c "import tkinter" >/dev/null 2>&1; then
+      PYTHON="$candidate"
+      break
+    fi
+  fi
+done
+if [[ -z "$PYTHON" ]]; then
+  echo "未找到带 tkinter 的 python3。请安装 Python 3.11+（建议 Anaconda / python.org / brew install python-tk）。" >&2
   exit 1
 fi
 
@@ -48,5 +59,5 @@ else
   nohup "$PYTHON" "$ROOT/eye_care.py" "${FILTERED[@]}" >>"$LOG_FILE" 2>&1 &
 fi
 echo "已在后台启动护眼锁屏助手 (PID $!)。"
-echo "悬浮倒计时 HUD 右键可退出；或运行 ./stop_eye_care.sh"
+echo "菜单栏图标或悬浮 HUD 右键可退出；或运行 ./stop_eye_care.sh"
 echo "日志: $LOG_FILE"

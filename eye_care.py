@@ -1,7 +1,9 @@
 """
 护眼锁屏助手 — Windows / macOS 定时全屏休息提醒。
 
-仅使用 Python 标准库（tkinter + ctypes + subprocess），无需 pip 安装。
+默认仅使用 Python 标准库（tkinter + ctypes + subprocess）。
+macOS 菜单栏状态项：若本机已有 PyObjC AppKit（如 Anaconda），自动启用；
+否则回退为悬浮 HUD 右键菜单（仍可零依赖运行）。
 目标系统：Windows 10+ / Windows Server 2022，macOS 12+（Apple Silicon / Intel），Python 3.11+。
 """
 
@@ -1325,10 +1327,31 @@ class TrayIcon:
 
 
 # ---------------------------------------------------------------------------
-# macOS 状态 UI（无第三方菜单栏依赖：HUD 右键菜单）
+# macOS 状态 UI（优先 AppKit 菜单栏；否则 HUD 右键菜单）
 # ---------------------------------------------------------------------------
+def _appkit_available() -> bool:
+    """PyObjC AppKit 是否可导入（Anaconda 常自带；否则可选 pip install pyobjc-framework-Cocoa）。"""
+    if not IS_MAC:
+        return False
+    try:
+        from AppKit import NSStatusBar  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 class MacStatusUI:
-    """与 TrayIcon 对齐的 start/stop/set_status API；菜单挂在 CountdownHud 上。"""
+    """与 TrayIcon 对齐的 start/stop/set_status API。
+
+    有 AppKit 时在菜单栏（右上角）显示剩余分钟 / 休息状态，菜单与 Windows 托盘一致；
+    同时保留悬浮 HUD 右键菜单。无 AppKit 时仅 HUD。
+    """
+
+    # 与 TrayIcon / HUD 一致的护眼色 (R,G,B) — 菜单栏用前景色
+    COLOR_OK = (200, 230, 201)
+    COLOR_MID = (240, 230, 184)
+    COLOR_NEAR = (245, 208, 200)
+    COLOR_REST = (178, 223, 219)
 
     def __init__(
         self,
@@ -1341,10 +1364,24 @@ class MacStatusUI:
         self.tooltip = tooltip
         self.status_label = tooltip
         self._hud: Optional["CountdownHud"] = None
+        self._tk_root: Optional[tk.Misc] = None
         self._running = False
+        self._use_menubar = False
+        self._status_item = None
+        self._menu = None
+        self._target = None
+        self._delegate = None
+        self._last_title_key: Optional[Tuple[str, bool]] = None
+        self._pump_job: Optional[str] = None
+        self._minutes: Optional[int] = None
+        self._resting = False
 
     def attach_hud(self, hud: "CountdownHud") -> None:
         self._hud = hud
+        try:
+            self._tk_root = hud.win.master  # type: ignore[assignment]
+        except Exception:  # noqa: BLE001
+            self._tk_root = None
         hud.bind_status_menu(
             on_break=self.on_break,
             on_exit=self.on_exit,
@@ -1356,13 +1393,30 @@ class MacStatusUI:
 
     def start(self) -> None:
         self._running = True
+        if IS_MAC and _appkit_available():
+            try:
+                self._start_menubar()
+                self._use_menubar = True
+                LOG.info(
+                    "macOS 菜单栏状态项已启用（剩余分钟 / 休息中）；"
+                    "点击图标打开菜单；悬浮 HUD 亦可右键。"
+                )
+                return
+            except Exception:  # noqa: BLE001
+                LOG.exception("macOS 菜单栏状态项创建失败，回退到 HUD 菜单")
+                self._teardown_menubar()
+                self._use_menubar = False
         LOG.info(
-            "macOS：无系统托盘时使用悬浮 HUD — 右键（或 Control+点击）打开菜单"
+            "macOS：使用悬浮 HUD — 右键（或 Control+点击）打开菜单"
             "（立即休息 / 开机自启 / 关于 / 退出）。"
+            "若需菜单栏图标，请使用带 PyObjC AppKit 的 Python"
+            "（如 Anaconda，或 pip install pyobjc-framework-Cocoa）。"
         )
 
     def stop(self) -> None:
         self._running = False
+        self._cancel_pump()
+        self._teardown_menubar()
 
     def set_status(
         self,
@@ -1374,8 +1428,224 @@ class MacStatusUI:
         self.tooltip = tip
         if menu_label is not None:
             self.status_label = menu_label
-        # minutes/resting 由 HUD.update 单独刷新；此处仅同步 tip/菜单状态行
-        _ = (minutes, resting)
+        self._minutes = minutes
+        self._resting = resting
+        if self._use_menubar and self._status_item is not None:
+            self._apply_menubar_status(tip, minutes, resting)
+
+    def _start_menubar(self) -> None:
+        # 必须先有 tk.Tk()（EyeCareApp 已创建），否则会与 Tk 的 NSApplication 冲突
+        from AppKit import (  # noqa: WPS433
+            NSAttributedString,
+            NSColor,
+            NSFont,
+            NSFontAttributeName,
+            NSForegroundColorAttributeName,
+            NSMenu,
+            NSMenuItem,
+            NSObject,
+            NSStatusBar,
+            NSVariableStatusItemLength,
+        )
+        ui = self
+
+        class _MenuTarget(NSObject):
+            def doBreak_(self, _sender):  # noqa: N802, ANN001
+                ui.on_break()
+
+            def doAutostart_(self, _sender):  # noqa: N802, ANN001
+                ui._toggle_autostart()
+
+            def doAbout_(self, _sender):  # noqa: N802, ANN001
+                ui._show_about()
+
+            def doExit_(self, _sender):  # noqa: N802, ANN001
+                ui.on_exit()
+
+        class _MenuDelegate(NSObject):
+            def menuNeedsUpdate_(self, menu):  # noqa: N802, ANN001
+                ui._refresh_menu_items(menu)
+
+        target = _MenuTarget.alloc().init()
+        delegate = _MenuDelegate.alloc().init()
+        menu = NSMenu.alloc().init()
+        menu.setDelegate_(delegate)
+
+        # 占位项；menuNeedsUpdate_ 会刷新标题 / 勾选
+        status_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            self.status_label[:64], None, ""
+        )
+        status_item.setEnabled_(False)
+        menu.addItem_(status_item)
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        for title, action in (
+            ("立即开始休息", "doBreak:"),
+            ("开机自动启动", "doAutostart:"),
+            ("关于", "doAbout:"),
+        ):
+            mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
+            mi.setTarget_(target)
+            menu.addItem_(mi)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+        exit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "退出", "doExit:", ""
+        )
+        exit_item.setTarget_(target)
+        menu.addItem_(exit_item)
+
+        bar_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength
+        )
+        button = bar_item.button()
+        if button is not None:
+            button.setToolTip_(self.tooltip)
+        bar_item.setMenu_(menu)
+
+        # 强引用，防止 PyObjC 对象被 GC
+        self._target = target
+        self._delegate = delegate
+        self._menu = menu
+        self._status_item = bar_item
+        self._NSColor = NSColor
+        self._NSFont = NSFont
+        self._NSAttributedString = NSAttributedString
+        self._NSForegroundColorAttributeName = NSForegroundColorAttributeName
+        self._NSFontAttributeName = NSFontAttributeName
+
+        self._apply_menubar_status(self.tooltip, self._minutes if self._minutes is not None else 20, False)
+        self._schedule_pump()
+
+    def _teardown_menubar(self) -> None:
+        item = self._status_item
+        self._status_item = None
+        self._menu = None
+        self._target = None
+        self._delegate = None
+        self._last_title_key = None
+        if item is None:
+            return
+        try:
+            from AppKit import NSStatusBar  # noqa: WPS433
+
+            NSStatusBar.systemStatusBar().removeStatusItem_(item)
+        except Exception:  # noqa: BLE001
+            LOG.debug("移除菜单栏状态项失败", exc_info=True)
+
+    def _schedule_pump(self) -> None:
+        """轻度泵送 Cocoa runloop，确保菜单栏点击在 tk 主循环下可靠响应。"""
+        self._cancel_pump()
+        root = self._tk_root
+        if root is None:
+            return
+
+        def _pump() -> None:
+            self._pump_job = None
+            if not self._running or not self._use_menubar:
+                return
+            try:
+                from Foundation import NSDate, NSDefaultRunLoopMode, NSRunLoop  # noqa: WPS433
+
+                NSRunLoop.currentRunLoop().runMode_beforeDate_(
+                    NSDefaultRunLoopMode,
+                    NSDate.dateWithTimeIntervalSinceNow_(0.02),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._pump_job = root.after(80, _pump)  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001
+                self._pump_job = None
+
+        try:
+            self._pump_job = root.after(80, _pump)  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            self._pump_job = None
+
+    def _cancel_pump(self) -> None:
+        job = self._pump_job
+        self._pump_job = None
+        root = self._tk_root
+        if job and root is not None:
+            try:
+                root.after_cancel(job)  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _fg_for(self, minutes: Optional[int], resting: bool) -> Tuple[int, int, int]:
+        if resting:
+            return self.COLOR_REST
+        if minutes is None:
+            return self.COLOR_OK
+        if minutes <= 5:
+            return self.COLOR_NEAR
+        if minutes <= 10:
+            return self.COLOR_MID
+        return self.COLOR_OK
+
+    def _apply_menubar_status(
+        self,
+        tip: str,
+        minutes: Optional[int],
+        resting: bool,
+    ) -> None:
+        item = self._status_item
+        if item is None:
+            return
+        if resting:
+            title = "休"
+        elif minutes is None:
+            title = "·"
+        else:
+            title = str(max(0, int(minutes)))
+            if len(title) > 2:
+                title = "99"
+        key = (title, resting)
+        button = item.button()
+        if button is not None:
+            try:
+                button.setToolTip_(tip.replace("\n", " — ")[:256])
+            except Exception:  # noqa: BLE001
+                pass
+        if key == self._last_title_key:
+            return
+        self._last_title_key = key
+        if button is None:
+            return
+        r, g, b = self._fg_for(minutes, resting)
+        try:
+            color = self._NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                r / 255.0, g / 255.0, b / 255.0, 1.0
+            )
+            font = self._NSFont.monospacedDigitSystemFontOfSize_weight_(13.0, 0.4)
+            attrs = {
+                self._NSForegroundColorAttributeName: color,
+                self._NSFontAttributeName: font,
+            }
+            astr = self._NSAttributedString.alloc().initWithString_attributes_(title, attrs)
+            button.setAttributedTitle_(astr)
+        except Exception:  # noqa: BLE001
+            try:
+                button.setTitle_(title)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _refresh_menu_items(self, menu) -> None:  # noqa: ANN001
+        try:
+            count = menu.numberOfItems()
+            if count < 1:
+                return
+            status = menu.itemAtIndex_(0)
+            if status is not None:
+                status.setTitle_(self.status_label[:64])
+            # 索引：0 状态, 1 分隔, 2 立即, 3 自启, 4 关于, 5 分隔, 6 退出
+            if count > 3:
+                auto = menu.itemAtIndex_(3)
+                if auto is not None:
+                    auto.setState_(1 if is_autostart_enabled() else 0)
+        except Exception:  # noqa: BLE001
+            LOG.debug("刷新菜单栏菜单失败", exc_info=True)
 
     @staticmethod
     def _show_about() -> None:
@@ -1387,7 +1657,7 @@ class MacStatusUI:
                 "定时全屏护眼提醒。\n"
                 "默认每 20 分钟休息 20 秒。\n"
                 "配置见 config.json。\n\n"
-                "macOS：右键悬浮倒计时打开菜单。",
+                "macOS：菜单栏图标或右键悬浮倒计时打开菜单。",
             )
         except Exception:  # noqa: BLE001
             LOG.info("关于：定时全屏护眼提醒，见 config.json")
@@ -1405,7 +1675,6 @@ class MacStatusUI:
                 )
             except Exception:  # noqa: BLE001
                 LOG.error("无法修改开机自启")
-
 
 
 
@@ -1485,7 +1754,7 @@ class CountdownHud:
         get_status_label: Callable[[], str],
         get_autostart: Callable[[], bool],
     ) -> None:
-        """绑定状态菜单（托盘之外的备用入口；macOS 主入口）。"""
+        """绑定状态菜单（托盘 / 菜单栏之外的备用入口；macOS 亦保留）。"""
         self._menu_on_break = on_break
         self._menu_on_exit = on_exit
         self._menu_on_about = on_about
@@ -1672,7 +1941,10 @@ class EyeCareApp:
         if IS_WINDOWS:
             LOG.info("系统托盘图标已启用：右键可「立即休息 / 开机自启 / 退出」；HUD 亦可右键。")
         elif IS_MAC:
-            LOG.info("macOS：悬浮 HUD 右键（或 Control+点击）打开菜单。按 Ctrl+C 也可退出。")
+            LOG.info(
+                "macOS：菜单栏状态项（若 AppKit 可用）+ 悬浮 HUD 右键菜单。"
+                "按 Ctrl+C 也可退出。"
+            )
         else:
             LOG.info("有限模式（非 Windows/macOS）。HUD 右键菜单可用；按 Ctrl+C 退出。")
 
