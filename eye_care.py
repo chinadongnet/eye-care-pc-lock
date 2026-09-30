@@ -165,6 +165,24 @@ def load_config(path: Path) -> Config:
 MonitorRect = Tuple[int, int, int, int]  # left, top, right, bottom
 
 
+def _tk_geometry(width: int, height: int, x: int, y: int) -> str:
+    """Tk geometry with correct signs for negative offsets.
+
+    Tk wants ``WxH±x±y`` (e.g. ``1920x1080-192-1080``), not ``+{neg}`` which
+    yields the invalid form ``+-192``.
+    """
+    xs = f"+{x}" if x >= 0 else str(x)
+    ys = f"+{y}" if y >= 0 else str(y)
+    return f"{width}x{height}{xs}{ys}"
+
+
+def _tk_position(x: int, y: int) -> str:
+    """Tk position-only geometry ``±x±y`` (drag / reposition)."""
+    xs = f"+{x}" if x >= 0 else str(x)
+    ys = f"+{y}" if y >= 0 else str(y)
+    return f"{xs}{ys}"
+
+
 def _primary_monitor_tk() -> List[MonitorRect]:
     """用 tkinter 探测主屏尺寸（回退路径）。"""
     root = tk.Tk()
@@ -224,7 +242,10 @@ def _get_monitors_mac() -> List[MonitorRect]:
     except Exception as exc:  # noqa: BLE001
         LOG.warning("macOS NSScreen 枚举失败，回退主屏：%s", exc)
 
-    # 不使用 ctypes CGDisplayBounds：Apple Silicon 上 CGRect 按值返回常错算 y。
+    # 不使用 ctypes CGDisplayBounds（已移除）：
+    # 1) Apple Silicon 上 CGRect 按值返回常错算 y；
+    # 2) 旧路径曾对 Y 做 main_height 翻转，而 CG 全局坐标原点已在主屏左上，
+    #    会把上方外接屏翻到下方（Codex P1-1）。NSScreen + _cocoa_frame_to_tk 为唯一路径。
     return _primary_monitor_tk()
 
 
@@ -514,7 +535,7 @@ class BreakOverlay:
         except tk.TclError:
             pass
 
-        geom = f"{width}x{height}+{left}+{top}"
+        geom = _tk_geometry(width, height, left, top)
         win.geometry(geom)
         win.deiconify()
         # macOS：deiconify 后偶发忽略首轮 geometry，再设一次并 update
@@ -973,32 +994,38 @@ def _set_autostart_windows(enabled: bool) -> bool:
 
 
 def _set_autostart_mac(enabled: bool) -> bool:
+    """安装/移除 LaunchAgent plist，供下次登录使用。
+
+    重要：从已在运行的 app 内切换自启时，只写/删 plist，不调用
+    ``launchctl bootstrap/load/bootout``。否则：
+    - enable + RunAtLoad + bootstrap 会再拉起第二份 eye_care；
+    - disable + bootout 会结束当前由 LaunchAgent 托管的进程。
+    立即启停请用 ``start_eye_care.sh`` / ``stop_eye_care.sh``。
+    """
     agents = _mac_launch_agents_dir()
     agents.mkdir(parents=True, exist_ok=True)
     plist = _mac_plist_path()
     if not enabled:
         if plist.is_file():
-            _mac_launchctl("bootout", plist)
-            _mac_launchctl("unload", plist)
             try:
                 plist.unlink()
             except OSError as exc:
                 LOG.error("删除 LaunchAgent 失败: %s", exc)
                 return False
-        LOG.info("已关闭开机自启（LaunchAgent）")
+        LOG.info(
+            "已关闭开机自启（已移除 LaunchAgent plist；当前进程继续运行，下次登录不再自启）"
+        )
         return True
 
     python = _python_for_autostart()
     script = _mac_sync_service_files(Path(__file__).resolve())
     body = _build_mac_plist(python, script)
-    # 先卸再写，避免残留旧定义
-    if plist.is_file():
-        _mac_launchctl("bootout", plist)
-        _mac_launchctl("unload", plist)
     plist.write_text(body, encoding="utf-8")
-    _mac_launchctl("bootstrap", plist)
-    _mac_launchctl("load", plist)
-    LOG.info("已开启开机自启: %s", plist)
+    LOG.info(
+        "已开启开机自启: %s（仅写入 plist + RunAtLoad，下次登录生效；"
+        "未 launchctl bootstrap，避免与当前进程重复）",
+        plist,
+    )
     return True
 
 
@@ -2133,7 +2160,7 @@ class CountdownHud:
         on_break: Callable[[], None],
         on_exit: Callable[[], None],
         on_about: Callable[[], None],
-        on_toggle_autostart: Callable[[], None],
+        on_toggle_autostart: Optional[Callable[[], None]],
         get_status_label: Callable[[], str],
         get_autostart: Callable[[], bool],
     ) -> None:
@@ -2153,7 +2180,7 @@ class CountdownHud:
         sh = self.win.winfo_screenheight()
         x = max(0, sw - w - 24)
         y = max(0, sh - h - 72)
-        self.win.geometry(f"{w}x{h}+{x}+{y}")
+        self.win.geometry(_tk_geometry(w, h, x, y))
 
     def _start_drag(self, event) -> None:  # noqa: ANN001
         self._drag_x = event.x_root - self.win.winfo_x()
@@ -2165,7 +2192,9 @@ class CountdownHud:
     def _on_drag(self, event) -> None:  # noqa: ANN001
         if abs(event.x_root - self._press_x_root) > 4 or abs(event.y_root - self._press_y_root) > 4:
             self._dragging = True
-        self.win.geometry(f"+{event.x_root - self._drag_x}+{event.y_root - self._drag_y}")
+        self.win.geometry(
+            _tk_position(event.x_root - self._drag_x, event.y_root - self._drag_y)
+        )
 
     def _end_drag(self, event) -> None:  # noqa: ANN001
         # 预留：左键短按不弹菜单，避免与拖动冲突；菜单用右键 / Control+点击
@@ -2179,9 +2208,10 @@ class CountdownHud:
         menu.add_command(label=status[:64], state="disabled")
         menu.add_separator()
         menu.add_command(label="立即开始休息", command=self._menu_on_break)
-        auto_on = bool(self._menu_get_autostart() if self._menu_get_autostart else False)
-        auto_label = "开机自动启动 ✓" if auto_on else "开机自动启动"
-        menu.add_command(label=auto_label, command=self._menu_on_toggle_autostart)
+        if self._menu_on_toggle_autostart is not None:
+            auto_on = bool(self._menu_get_autostart() if self._menu_get_autostart else False)
+            auto_label = "开机自动启动 ✓" if auto_on else "开机自动启动"
+            menu.add_command(label=auto_label, command=self._menu_on_toggle_autostart)
         menu.add_command(label="关于", command=self._menu_on_about)
         menu.add_separator()
         menu.add_command(label="退出", command=self._menu_on_exit)
@@ -2235,6 +2265,48 @@ class CountdownHud:
 
 
 # ---------------------------------------------------------------------------
+# 非 macOS/Windows：仅 HUD（无菜单栏、无开机自启项）
+# ---------------------------------------------------------------------------
+class HudOnlyStatus:
+    """Linux / 其它平台的平台中立状态桩：与 TrayIcon/MacStatusUI 同 start/stop/set_status。
+
+    不提供 LaunchAgent / 开机自启菜单（set_autostart_enabled 在非 Win/Mac 上恒失败）。
+    """
+
+    def __init__(
+        self,
+        on_break: Callable[[], None],
+        on_exit: Callable[[], None],
+        tooltip: str = APP_NAME,
+    ) -> None:
+        self.on_break = on_break
+        self.on_exit = on_exit
+        self.tooltip = tooltip
+        self.status_label = tooltip
+
+    def start(self) -> None:
+        LOG.info(
+            "非 Windows/macOS：使用悬浮 HUD 右键菜单（立即休息 / 关于 / 退出）；"
+            "不提供开机自启。"
+        )
+
+    def stop(self) -> None:
+        return
+
+    def set_status(
+        self,
+        tip: str,
+        menu_label: Optional[str] = None,
+        minutes: Optional[int] = None,
+        resting: bool = False,
+    ) -> None:
+        self.tooltip = tip
+        if menu_label is not None:
+            self.status_label = menu_label
+        _ = (minutes, resting)
+
+
+# ---------------------------------------------------------------------------
 # 主应用
 # ---------------------------------------------------------------------------
 class EyeCareApp:
@@ -2258,10 +2330,17 @@ class EyeCareApp:
             on_break = lambda: self.root.after(0, self.start_break)
             on_exit = lambda: self.root.after(0, self.request_exit)
             self.tray = TrayIcon(on_break=on_break, on_exit=on_exit, tooltip=tip)
-        else:
+        elif IS_MAC:
             # macOS：AppKit 菜单经 MacStatusUI 动作队列入队，由 Tk 轮询执行。
             # 此处必须传裸回调；禁止再包一层 root.after（AppKit 路径会 SIGABRT）。
             self.tray = MacStatusUI(
+                on_break=self.start_break,
+                on_exit=self.request_exit,
+                tooltip=tip,
+            )
+        else:
+            # Linux / 其它：平台中立 HUD，无 Mac 专用自启菜单。
+            self.tray = HudOnlyStatus(
                 on_break=self.start_break,
                 on_exit=self.request_exit,
                 tooltip=tip,
@@ -2307,6 +2386,15 @@ class EyeCareApp:
 
         if isinstance(self.tray, MacStatusUI):
             self.tray.attach_hud(self.hud)
+        elif isinstance(self.tray, HudOnlyStatus):
+            self.hud.bind_status_menu(
+                on_break=self.start_break,
+                on_exit=self.request_exit,
+                on_about=on_about,
+                on_toggle_autostart=None,  # type: ignore[arg-type]
+                get_status_label=lambda: self.tray.status_label,
+                get_autostart=lambda: False,
+            )
         else:
             self.hud.bind_status_menu(
                 on_break=lambda: self.root.after(0, self.start_break),
