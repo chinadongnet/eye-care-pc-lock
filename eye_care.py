@@ -1451,16 +1451,17 @@ class MacStatusUI:
 
         class _MenuTarget(NSObject):
             def doBreak_(self, _sender):  # noqa: N802, ANN001
-                ui.on_break()
+                # AppKit 菜单回调里不要直接碰 tkinter；丢回 Tk 主线程
+                ui._on_main(ui.on_break)
 
             def doAutostart_(self, _sender):  # noqa: N802, ANN001
-                ui._toggle_autostart()
+                ui._on_main(ui._toggle_autostart)
 
             def doAbout_(self, _sender):  # noqa: N802, ANN001
-                ui._show_about()
+                ui._on_main(ui._show_about)
 
             def doExit_(self, _sender):  # noqa: N802, ANN001
-                ui.on_exit()
+                ui._on_main(ui.on_exit)
 
         class _MenuDelegate(NSObject):
             def menuNeedsUpdate_(self, menu):  # noqa: N802, ANN001
@@ -1647,34 +1648,70 @@ class MacStatusUI:
         except Exception:  # noqa: BLE001
             LOG.debug("刷新菜单栏菜单失败", exc_info=True)
 
-    @staticmethod
-    def _show_about() -> None:
+    def _on_main(self, fn: Callable[[], None]) -> None:
+        """把回调丢到 Tk 主线程，避免 AppKit 菜单动作里直接调 tkinter 导致崩溃退出。"""
+        root = self._tk_root
+        if root is not None:
+            try:
+                root.after(0, fn)  # type: ignore[union-attr]
+                return
+            except Exception:  # noqa: BLE001
+                LOG.debug("调度到 Tk 主线程失败，改为直接调用", exc_info=True)
+        try:
+            fn()
+        except Exception:  # noqa: BLE001
+            LOG.exception("菜单回调执行失败")
+
+    def _show_about(self) -> None:
+        msg = (
+            "定时全屏护眼提醒。\n"
+            "默认每 20 分钟休息 20 秒。\n"
+            "配置见 config.json。\n\n"
+            "macOS：菜单栏图标或右键悬浮倒计时打开菜单。"
+        )
+        # 优先用 NSAlert，避免与 Tk messagebox / NSApplication 冲突
+        if IS_MAC and _appkit_available():
+            try:
+                from AppKit import NSAlert  # noqa: WPS433
+
+                alert = NSAlert.alloc().init()
+                alert.setMessageText_(APP_NAME)
+                alert.setInformativeText_(msg)
+                alert.addButtonWithTitle_("好")
+                alert.runModal()
+                return
+            except Exception:  # noqa: BLE001
+                LOG.debug("NSAlert 关于框失败，回退 messagebox", exc_info=True)
         try:
             from tkinter import messagebox
 
-            messagebox.showinfo(
-                APP_NAME,
-                "定时全屏护眼提醒。\n"
-                "默认每 20 分钟休息 20 秒。\n"
-                "配置见 config.json。\n\n"
-                "macOS：菜单栏图标或右键悬浮倒计时打开菜单。",
-            )
+            messagebox.showinfo(APP_NAME, msg)
         except Exception:  # noqa: BLE001
             LOG.info("关于：定时全屏护眼提醒，见 config.json")
 
-    @staticmethod
-    def _toggle_autostart() -> None:
+    def _toggle_autostart(self) -> None:
         want = not is_autostart_enabled()
-        if not set_autostart_enabled(want):
+        if set_autostart_enabled(want):
+            return
+        err = "无法修改开机自启。\n请检查 ~/Library/LaunchAgents 权限后重试。"
+        if IS_MAC and _appkit_available():
             try:
-                from tkinter import messagebox
+                from AppKit import NSAlert  # noqa: WPS433
 
-                messagebox.showerror(
-                    APP_NAME,
-                    "无法修改开机自启。\n请检查 ~/Library/LaunchAgents 权限后重试。",
-                )
+                alert = NSAlert.alloc().init()
+                alert.setMessageText_(APP_NAME)
+                alert.setInformativeText_(err)
+                alert.addButtonWithTitle_("好")
+                alert.runModal()
+                return
             except Exception:  # noqa: BLE001
-                LOG.error("无法修改开机自启")
+                LOG.debug("NSAlert 自启错误框失败", exc_info=True)
+        try:
+            from tkinter import messagebox
+
+            messagebox.showerror(APP_NAME, err)
+        except Exception:  # noqa: BLE001
+            LOG.error("无法修改开机自启")
 
 
 
