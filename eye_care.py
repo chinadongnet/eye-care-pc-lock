@@ -317,6 +317,55 @@ def lock_workstation() -> None:
     LOG.warning("当前平台不支持 lock_workstation，已跳过。")
 
 
+def _apple_script_escape(s: str) -> str:
+    """Escape a Python string for an AppleScript double-quoted literal."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _macos_dialog_script(title: str, message: str, button: str = "好") -> str:
+    """Build `display dialog` AppleScript (runs outside our process)."""
+    parts = [
+        _apple_script_escape(p)
+        for p in message.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+    if len(parts) == 1:
+        msg_expr = f'"{parts[0]}"'
+    else:
+        msg_expr = " & return & ".join(f'"{p}"' for p in parts)
+    title_q = _apple_script_escape(title)
+    btn_q = _apple_script_escape(button)
+    return (
+        f'display dialog {msg_expr} with title "{title_q}" '
+        f'buttons {{"{btn_q}"}} default button 1'
+    )
+
+
+def _macos_show_dialog_detached(title: str, message: str, button: str = "好") -> bool:
+    """Show an About/info dialog via detached osascript.
+
+    Do NOT call NSAlert.runModal or tkinter.messagebox from the status-item
+    menu path: under launchd + Tk + AppKit they share NSApplication and can
+    abort the Python process (PyEval_RestoreThread / Abort trap 6).
+    A separate osascript process owns the modal dialog and cannot kill us.
+    """
+    if not IS_MAC:
+        return False
+    try:
+        script = _macos_dialog_script(title, message, button=button)
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        LOG.debug("osascript display dialog 启动失败", exc_info=True)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # 全屏遮罩
 # ---------------------------------------------------------------------------
@@ -1787,6 +1836,35 @@ class MacStatusUI:
         except Exception:  # noqa: BLE001
             LOG.exception("菜单回调执行失败")
 
+    def _flash_menu_status(self, text: str, restore_after_ms: int = 4000) -> None:
+        """Temporarily show a short note on the disabled status menu item."""
+        prev = self.status_label
+        self.status_label = text[:64]
+        menu = self._menu
+        if menu is not None:
+            try:
+                self._refresh_menu_items(menu)
+            except Exception:  # noqa: BLE001
+                LOG.debug("刷新关于状态标签失败", exc_info=True)
+        root = self._tk_root
+        if root is None:
+            return
+
+        def _restore() -> None:
+            # 勿覆盖期间被倒计时刷新写过的新状态
+            if self.status_label == text[:64]:
+                self.status_label = prev
+                if self._menu is not None:
+                    try:
+                        self._refresh_menu_items(self._menu)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        try:
+            root.after(restore_after_ms, _restore)  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+
     def _show_about(self) -> None:
         msg = (
             "定时全屏护眼提醒。\n"
@@ -1794,49 +1872,24 @@ class MacStatusUI:
             "配置见 config.json。\n\n"
             "macOS：菜单栏图标或右键悬浮倒计时打开菜单。"
         )
-        # 优先用 NSAlert，避免与 Tk messagebox / NSApplication 冲突
-        if IS_MAC and _appkit_available():
-            try:
-                from AppKit import NSAlert  # noqa: WPS433
-
-                alert = NSAlert.alloc().init()
-                alert.setMessageText_(APP_NAME)
-                alert.setInformativeText_(msg)
-                alert.addButtonWithTitle_("好")
-                alert.runModal()
-                return
-            except Exception:  # noqa: BLE001
-                LOG.debug("NSAlert 关于框失败，回退 messagebox", exc_info=True)
-        try:
-            from tkinter import messagebox
-
-            messagebox.showinfo(APP_NAME, msg)
-        except Exception:  # noqa: BLE001
-            LOG.info("关于：定时全屏护眼提醒，见 config.json")
+        LOG.info("关于：定时全屏护眼提醒，见 config.json")
+        self._flash_menu_status("关于：已弹出系统对话框")
+        # 切勿对共享 NSApp 调 NSAlert.runModal / tkinter.messagebox：
+        # launchd + Tk + AppKit 下会 abort（GIL / Abort trap 6）。
+        if IS_MAC and _macos_show_dialog_detached(APP_NAME, msg):
+            return
+        # 非 macOS 或 osascript 不可用时仅记日志，不阻塞进程
+        LOG.info("关于内容：%s", msg.replace("\n", " | "))
 
     def _toggle_autostart(self) -> None:
         want = not is_autostart_enabled()
         if set_autostart_enabled(want):
             return
         err = "无法修改开机自启。\n请检查 ~/Library/LaunchAgents 权限后重试。"
-        if IS_MAC and _appkit_available():
-            try:
-                from AppKit import NSAlert  # noqa: WPS433
-
-                alert = NSAlert.alloc().init()
-                alert.setMessageText_(APP_NAME)
-                alert.setInformativeText_(err)
-                alert.addButtonWithTitle_("好")
-                alert.runModal()
-                return
-            except Exception:  # noqa: BLE001
-                LOG.debug("NSAlert 自启错误框失败", exc_info=True)
-        try:
-            from tkinter import messagebox
-
-            messagebox.showerror(APP_NAME, err)
-        except Exception:  # noqa: BLE001
-            LOG.error("无法修改开机自启")
+        LOG.error("无法修改开机自启")
+        self._flash_menu_status("自启修改失败")
+        if IS_MAC and _macos_show_dialog_detached(APP_NAME, err):
+            return
 
 
 
