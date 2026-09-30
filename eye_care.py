@@ -14,6 +14,7 @@ import atexit
 import json
 import logging
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -384,7 +385,7 @@ def _macos_show_about_external() -> bool:
 
     Writes a small text file and `open`s it in a new process. Safe to call
     directly from an NSStatusItem menu action (do not route through
-    root.after / _on_main — that path hits Tk AfterProc and aborts with
+    root.after / action marshal from AppKit — that path hits Tk AfterProc and aborts with
     SIGABRT / PyEval_RestoreThread under Tk+AppKit+launchd).
     """
     if not IS_MAC:
@@ -1512,6 +1513,13 @@ class MacStatusUI:
         self._delegate = None
         self._last_title_key: Optional[Tuple[str, bool]] = None
         self._pump_job: Optional[str] = None
+        self._action_poll_job: Optional[str] = None
+        # AppKit menu callbacks MUST NOT call root.after / Tk.
+        # They only enqueue action names; Tk-started poll drains them.
+        self._action_q: "queue.Queue[str]" = queue.Queue()
+        self._flash_text: Optional[str] = None
+        self._flash_prev: Optional[str] = None
+        self._flash_until: float = 0.0
         self._minutes: Optional[int] = None
         self._resting = False
 
@@ -1521,6 +1529,8 @@ class MacStatusUI:
             self._tk_root = hud.win.master  # type: ignore[assignment]
         except Exception:  # noqa: BLE001
             self._tk_root = None
+        # Start the AppKit→Tk action poll from Tk init (never from AppKit).
+        self._schedule_action_poll()
         hud.bind_status_menu(
             on_break=self.on_break,
             on_exit=self.on_exit,
@@ -1532,6 +1542,8 @@ class MacStatusUI:
 
     def start(self) -> None:
         self._running = True
+        # Ensure Tk action poll is alive (attach_hud may have run before _running).
+        self._schedule_action_poll()
         if IS_MAC and _appkit_available():
             try:
                 self._start_menubar()
@@ -1556,6 +1568,7 @@ class MacStatusUI:
     def stop(self) -> None:
         self._running = False
         self._cancel_pump()
+        self._cancel_action_poll()
         self._teardown_menubar()
 
     def set_status(
@@ -1594,17 +1607,19 @@ class MacStatusUI:
         ui = self
 
         class _MenuTarget(NSObject):
+            # CRITICAL: AppKit menu actions must NEVER call root.after / Tk /
+            # _on_main. Nested NSRunLoop inside Tk AfterProc + after() →
+            # PyEval_RestoreThread / SIGABRT under Tk+AppKit+launchd.
+            # Only enqueue thread-safe tokens; Tk action-poll drains them.
+
             def doBreak_(self, _sender):  # noqa: N802, ANN001
-                # AppKit 菜单回调里不要直接碰 tkinter；丢回 Tk 主线程
-                ui._on_main(ui.on_break)
+                ui._enqueue_action("break")
 
             def doAutostart_(self, _sender):  # noqa: N802, ANN001
-                ui._on_main(ui._toggle_autostart)
+                ui._enqueue_action("autostart")
 
             def doAbout_(self, _sender):  # noqa: N802, ANN001
-                # NEVER schedule About onto Tk via root.after / _on_main.
-                # Crash report PID 34961: AfterProc → PyEval_RestoreThread → SIGABRT.
-                # Only spawn an external viewer; no Tk widgets, no AppKit modal.
+                # About needs zero Tk: open external viewer from this callback.
                 try:
                     LOG.info("菜单栏「关于」：外部打开 ABOUT.txt（绕过 Tk）")
                     if not _macos_show_about_external():
@@ -1613,7 +1628,7 @@ class MacStatusUI:
                     LOG.exception("菜单栏「关于」失败")
 
             def doExit_(self, _sender):  # noqa: N802, ANN001
-                ui._on_main(ui.on_exit)
+                ui._enqueue_action("exit")
 
         class _MenuDelegate(NSObject):
             def menuNeedsUpdate_(self, menu):  # noqa: N802, ANN001
@@ -1711,12 +1726,17 @@ class MacStatusUI:
             try:
                 from Foundation import NSDate, NSDefaultRunLoopMode, NSRunLoop  # noqa: WPS433
 
+                # Menu clicks may fire HERE nested inside this AfterProc.
+                # Handlers only enqueue; do NOT touch Tk until runMode returns.
                 NSRunLoop.currentRunLoop().runMode_beforeDate_(
                     NSDefaultRunLoopMode,
                     NSDate.dateWithTimeIntervalSinceNow_(0.02),
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # Safe: back in Tk after-callback after Cocoa returned.
+            self._drain_actions()
+            self._tick_flash_status()
             try:
                 self._pump_job = root.after(80, _pump)  # type: ignore[union-attr]
             except Exception:  # noqa: BLE001
@@ -1883,51 +1903,106 @@ class MacStatusUI:
         except Exception:  # noqa: BLE001
             LOG.debug("刷新菜单栏菜单失败", exc_info=True)
 
-    def _on_main(self, fn: Callable[[], None]) -> None:
-        """把回调丢到 Tk 主线程，避免 AppKit 菜单动作里直接调 tkinter 导致崩溃退出。"""
-        root = self._tk_root
-        if root is not None:
-            try:
-                root.after(0, fn)  # type: ignore[union-attr]
-                return
-            except Exception:  # noqa: BLE001
-                LOG.debug("调度到 Tk 主线程失败，改为直接调用", exc_info=True)
+    def _enqueue_action(self, action: str) -> None:
+        """Thread-safe; safe to call from AppKit menu callbacks (no Tk)."""
         try:
-            fn()
+            self._action_q.put_nowait(action)
+            LOG.debug("AppKit 菜单入队动作：%s", action)
         except Exception:  # noqa: BLE001
-            LOG.exception("菜单回调执行失败")
+            LOG.exception("菜单动作入队失败：%s", action)
+
+    def _schedule_action_poll(self) -> None:
+        """Start one Tk-owned poll chain (reschedules only from within Tk)."""
+        self._cancel_action_poll()
+        root = self._tk_root
+        if root is None:
+            return
+
+        def _poll() -> None:
+            self._action_poll_job = None
+            if not self._running and self._action_q.empty():
+                return
+            self._drain_actions()
+            self._tick_flash_status()
+            if not self._running:
+                return
+            try:
+                self._action_poll_job = root.after(200, _poll)  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001
+                self._action_poll_job = None
+
+        try:
+            self._action_poll_job = root.after(200, _poll)  # type: ignore[union-attr]
+            LOG.debug("已启动 AppKit→Tk 动作轮询（200ms，仅 Tk 内自调度）")
+        except Exception:  # noqa: BLE001
+            self._action_poll_job = None
+
+    def _cancel_action_poll(self) -> None:
+        job = self._action_poll_job
+        self._action_poll_job = None
+        root = self._tk_root
+        if job and root is not None:
+            try:
+                root.after_cancel(job)  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _drain_actions(self) -> None:
+        """Run queued menu actions on the Tk thread only."""
+        while True:
+            try:
+                action = self._action_q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if action == "break":
+                    LOG.info("菜单「立即开始休息」：由 Tk 轮询执行")
+                    self.on_break()
+                elif action == "exit":
+                    LOG.info("菜单「退出」：由 Tk 轮询执行")
+                    self.on_exit()
+                elif action == "autostart":
+                    LOG.info("菜单「开机自动启动」：由 Tk 轮询执行")
+                    self._toggle_autostart()
+                elif action == "about":
+                    self._show_about()
+                else:
+                    LOG.warning("未知菜单动作：%s", action)
+            except Exception:  # noqa: BLE001
+                LOG.exception("执行菜单动作失败：%s", action)
 
     def _flash_menu_status(self, text: str, restore_after_ms: int = 4000) -> None:
-        """Temporarily show a short note on the disabled status menu item."""
-        prev = self.status_label
-        self.status_label = text[:64]
+        """Temporarily show a note on the status menu item (no root.after)."""
+        self._flash_prev = self.status_label
+        self._flash_text = text[:64]
+        self.status_label = self._flash_text
+        self._flash_until = time.monotonic() + max(0.2, restore_after_ms / 1000.0)
         menu = self._menu
         if menu is not None:
             try:
                 self._refresh_menu_items(menu)
             except Exception:  # noqa: BLE001
-                LOG.debug("刷新关于状态标签失败", exc_info=True)
-        root = self._tk_root
-        if root is None:
+                LOG.debug("刷新状态标签失败", exc_info=True)
+
+    def _tick_flash_status(self) -> None:
+        """Restore flashed status label from Tk poll (never AppKit)."""
+        if self._flash_text is None:
             return
-
-        def _restore() -> None:
-            # 勿覆盖期间被倒计时刷新写过的新状态
-            if self.status_label == text[:64]:
-                self.status_label = prev
-                if self._menu is not None:
-                    try:
-                        self._refresh_menu_items(self._menu)
-                    except Exception:  # noqa: BLE001
-                        pass
-
-        try:
-            root.after(restore_after_ms, _restore)  # type: ignore[union-attr]
-        except Exception:  # noqa: BLE001
-            pass
+        if time.monotonic() < self._flash_until:
+            return
+        text = self._flash_text
+        self._flash_text = None
+        if self.status_label == text and self._flash_prev is not None:
+            self.status_label = self._flash_prev
+            if self._menu is not None:
+                try:
+                    self._refresh_menu_items(self._menu)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._flash_prev = None
 
     def _show_about(self) -> None:
-        """About from HUD Tk menu — still must not flash via AppKit+Tk after."""
+        """About from HUD Tk menu — external viewer only (no messagebox/NSAlert)."""
         LOG.info("HUD「关于」：外部打开 ABOUT.txt（不碰 messagebox / NSAlert / after）")
         if IS_MAC and _macos_show_about_external():
             return
@@ -1936,10 +2011,14 @@ class MacStatusUI:
     def _toggle_autostart(self) -> None:
         want = not is_autostart_enabled()
         if set_autostart_enabled(want):
+            state = "已开启" if want else "已关闭"
+            LOG.info("开机自动启动%s", state)
+            self._flash_menu_status(f"开机自启{state}")
             return
         err = "无法修改开机自启。\n请检查 ~/Library/LaunchAgents 权限后重试。"
         LOG.error("无法修改开机自启")
         self._flash_menu_status("自启修改失败")
+        # Detached osascript only — never in-process modal from this process.
         if IS_MAC and _macos_show_dialog_detached(APP_NAME, err):
             return
 
@@ -2136,14 +2215,20 @@ class EyeCareApp:
         self._next_break_at = time.monotonic() + config.interval_minutes * 60
         self._scheduler_job: Optional[str] = None
 
-        on_break = lambda: self.root.after(0, self.start_break)
-        on_exit = lambda: self.root.after(0, self.request_exit)
         tip = f"{APP_NAME}（间隔 {config.interval_minutes:g} 分钟）"
         if IS_WINDOWS:
+            # Windows 托盘可能在非 Tk 线程回调；用 after 切回主线程。
+            on_break = lambda: self.root.after(0, self.start_break)
+            on_exit = lambda: self.root.after(0, self.request_exit)
             self.tray = TrayIcon(on_break=on_break, on_exit=on_exit, tooltip=tip)
         else:
-            # macOS / 其它：MacStatusUI（HUD 菜单）；保持与 TrayIcon 相同的 start/stop/set_status
-            self.tray = MacStatusUI(on_break=on_break, on_exit=on_exit, tooltip=tip)
+            # macOS：AppKit 菜单经 MacStatusUI 动作队列入队，由 Tk 轮询执行。
+            # 此处必须传裸回调；禁止再包一层 root.after（AppKit 路径会 SIGABRT）。
+            self.tray = MacStatusUI(
+                on_break=self.start_break,
+                on_exit=self.request_exit,
+                tooltip=tip,
+            )
         self.hud = CountdownHud(self.root)
         self._wire_hud_menu()
         atexit.register(self._cleanup)
@@ -2225,6 +2310,14 @@ class EyeCareApp:
     def _schedule_check(self) -> None:
         if self._stopping:
             return
+        # Belt-and-suspenders: drain AppKit menu actions on the Tk timer
+        # (MacStatusUI also drains in its 200ms poll / Cocoa pump).
+        if isinstance(self.tray, MacStatusUI):
+            try:
+                self.tray._drain_actions()
+                self.tray._tick_flash_status()
+            except Exception:  # noqa: BLE001
+                LOG.debug("drain menu actions failed", exc_info=True)
         now = time.monotonic()
         if now >= self._next_break_at and self._overlay is None:
             self.start_break()
