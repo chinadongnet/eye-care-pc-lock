@@ -177,59 +177,64 @@ def _primary_monitor_tk() -> List[MonitorRect]:
     return [(0, 0, w, h)]
 
 
+def _cocoa_frame_to_tk(frame, main_height: float) -> MonitorRect:
+    """Cocoa/NSScreen frame（主屏左下原点、y 向上）→ Tk（主屏左上原点、y 向下）。"""
+    left = int(round(float(frame.origin.x)))
+    top = int(round(main_height - (float(frame.origin.y) + float(frame.size.height))))
+    right = int(round(float(frame.origin.x) + float(frame.size.width)))
+    bottom = int(round(main_height - float(frame.origin.y)))
+    return (left, top, right, bottom)
+
+
 def _get_monitors_mac() -> List[MonitorRect]:
-    """通过 CoreGraphics/Quartz 枚举显示器；坐标转为 tk 常用的左上原点。"""
+    """枚举所有显示器为 Tk 坐标。
+
+    优先 AppKit NSScreen（PyObjC）：ctypes 对 CGDisplayBounds 返回的 CGRect
+    在 Apple Silicon 上不可靠，曾把上方外接屏错算到主屏下方，导致副屏无遮罩、
+    主屏只看到「副屏简版」UI。
+    """
+    # 1) NSScreen via PyObjC（与菜单栏同一依赖；坐标正确）
     try:
-        cg = ctypes.CDLL(
-            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
-        )
+        from AppKit import NSScreen  # noqa: WPS433
 
-        class CGPoint(ctypes.Structure):
-            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
-
-        class CGSize(ctypes.Structure):
-            _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
-
-        class CGRect(ctypes.Structure):
-            _fields_ = [("origin", CGPoint), ("size", CGSize)]
-
-        CGDirectDisplayID = ctypes.c_uint32
-        max_displays = 32
-        display_count = ctypes.c_uint32(0)
-        displays = (CGDirectDisplayID * max_displays)()
-
-        cg.CGGetActiveDisplayList.argtypes = [
-            ctypes.c_uint32,
-            ctypes.POINTER(CGDirectDisplayID),
-            ctypes.POINTER(ctypes.c_uint32),
-        ]
-        cg.CGGetActiveDisplayList.restype = ctypes.c_int32
-        cg.CGMainDisplayID.argtypes = []
-        cg.CGMainDisplayID.restype = CGDirectDisplayID
-        cg.CGDisplayBounds.argtypes = [CGDirectDisplayID]
-        cg.CGDisplayBounds.restype = CGRect
-
-        err = cg.CGGetActiveDisplayList(max_displays, displays, ctypes.byref(display_count))
-        if err != 0 or display_count.value == 0:
-            raise RuntimeError(f"CGGetActiveDisplayList err={err}")
-
-        main_bounds = cg.CGDisplayBounds(cg.CGMainDisplayID())
-        main_height = float(main_bounds.size.height)
+        screens = list(NSScreen.screens() or [])
+        if not screens:
+            raise RuntimeError("NSScreen.screens() empty")
+        main = NSScreen.mainScreen() or screens[0]
+        main_height = float(main.frame().size.height)
         monitors: List[MonitorRect] = []
-        for i in range(int(display_count.value)):
-            b = cg.CGDisplayBounds(displays[i])
-            # Quartz：原点在主屏左下，y 向上；tk：原点主屏左上，y 向下
-            left = int(round(b.origin.x))
-            top = int(round(main_height - (b.origin.y + b.size.height)))
-            right = int(round(b.origin.x + b.size.width))
-            bottom = int(round(main_height - b.origin.y))
+        for screen in screens:
+            rect = _cocoa_frame_to_tk(screen.frame(), main_height)
+            left, top, right, bottom = rect
             if right > left and bottom > top:
-                monitors.append((left, top, right, bottom))
+                monitors.append(rect)
+                try:
+                    name = str(screen.localizedName())
+                except Exception:  # noqa: BLE001
+                    name = "?"
+                LOG.info(
+                    "macOS 显示器 NSScreen %s → Tk LTRB=%s size=%dx%d",
+                    name,
+                    rect,
+                    right - left,
+                    bottom - top,
+                )
         if monitors:
             return monitors
     except Exception as exc:  # noqa: BLE001
-        LOG.warning("macOS 多显示器枚举失败，回退主屏：%s", exc)
+        LOG.warning("macOS NSScreen 枚举失败，回退主屏：%s", exc)
+
+    # 不使用 ctypes CGDisplayBounds：Apple Silicon 上 CGRect 按值返回常错算 y。
     return _primary_monitor_tk()
+
+
+def _pick_primary_monitor(monitors: List[MonitorRect]) -> MonitorRect:
+    """主交互屏：含桌面原点 (0,0) 的显示器（系统主屏），否则取面积最大。"""
+    for rect in monitors:
+        left, top, right, bottom = rect
+        if left <= 0 < right and top <= 0 < bottom:
+            return rect
+    return max(monitors, key=lambda m: (m[2] - m[0]) * (m[3] - m[1]))
 
 
 def _get_monitors_windows() -> List[MonitorRect]:
@@ -448,18 +453,26 @@ class BreakOverlay:
         self._closed = False
         self._countdown_job: Optional[str] = None
         self._primary_labels: dict[str, tk.Label] = {}
+        self._countdown_labels: List[tk.Label] = []
+        self._hint_labels: List[tk.Label] = []
+        self._dismiss_buttons: List[tk.Button] = []
         self._dismiss_btn: Optional[tk.Button] = None
 
     def show(self) -> None:
         monitors = get_monitors()
-        LOG.info("开始护眼休息，显示器数=%d，时长=%ds", len(monitors), self.config.break_seconds)
+        LOG.info(
+            "开始护眼休息，显示器数=%d，时长=%ds，几何=%s",
+            len(monitors),
+            self.config.break_seconds,
+            monitors,
+        )
 
         if self.config.lock_workstation:
             # 可选：真正锁屏。遮罩仍会显示；用户解锁后若倒计时未完会继续看到遮罩。
             lock_workstation()
 
-        # 主屏（含原点或面积最大）优先作为可交互/信息完整的遮罩
-        primary = max(monitors, key=lambda m: (m[2] - m[0]) * (m[3] - m[1]))
+        # 系统主屏（含原点）为 grab / 焦点优先；各屏 UI 内容相同，避免「菜单休息看起来不一样」
+        primary = _pick_primary_monitor(monitors)
         for rect in monitors:
             self._create_window(rect, is_primary=(rect == primary))
 
@@ -501,10 +514,28 @@ class BreakOverlay:
         except tk.TclError:
             pass
 
-        win.geometry(f"{width}x{height}+{left}+{top}")
+        geom = f"{width}x{height}+{left}+{top}"
+        win.geometry(geom)
         win.deiconify()
+        # macOS：deiconify 后偶发忽略首轮 geometry，再设一次并 update
+        try:
+            win.update_idletasks()
+            win.geometry(geom)
+        except tk.TclError:
+            pass
         win.lift()
-        win.focus_force()
+        if is_primary:
+            win.focus_force()
+
+        LOG.info(
+            "休息遮罩窗口%s geometry=%s winfo=(%s,%s %sx%s)",
+            " [主屏]" if is_primary else "",
+            geom,
+            win.winfo_rootx(),
+            win.winfo_rooty(),
+            win.winfo_width(),
+            win.winfo_height(),
+        )
 
         # 拦截关闭键，防止 Alt+F4 提前退出（休息期间）
         win.protocol("WM_DELETE_WINDOW", lambda: None)
@@ -512,88 +543,86 @@ class BreakOverlay:
         frame = tk.Frame(win, bg=BG)
         frame.place(relx=0.5, rely=0.5, anchor="center")
 
+        # 每块屏幕同一套完整 UI（标题/文案/倒计时），菜单触发与定时触发一致
+        title = tk.Label(
+            frame,
+            text=self.config.title,
+            font=self._pick_font(42, bold=True),
+            fg=ACCENT,
+            bg=BG,
+        )
+        title.pack(pady=(0, 24))
+
+        msg = tk.Label(
+            frame,
+            text=self.config.message,
+            font=self._pick_font(18),
+            fg=FG,
+            bg=BG,
+            justify="center",
+        )
+        msg.pack(pady=(0, 36))
+
+        countdown = tk.Label(
+            frame,
+            text=str(self._remaining),
+            font=self._pick_font(96, bold=True),
+            fg=FG,
+            bg=BG,
+        )
+        countdown.pack(pady=(0, 8))
+        self._countdown_labels.append(countdown)
         if is_primary:
-            title = tk.Label(
-                frame,
-                text=self.config.title,
-                font=self._pick_font(42, bold=True),
-                fg=ACCENT,
-                bg=BG,
-            )
-            title.pack(pady=(0, 24))
-
-            msg = tk.Label(
-                frame,
-                text=self.config.message,
-                font=self._pick_font(18),
-                fg=FG,
-                bg=BG,
-                justify="center",
-            )
-            msg.pack(pady=(0, 36))
-
-            countdown = tk.Label(
-                frame,
-                text=str(self._remaining),
-                font=self._pick_font(96, bold=True),
-                fg=FG,
-                bg=BG,
-            )
-            countdown.pack(pady=(0, 8))
             self._primary_labels["countdown"] = countdown
 
-            hint = tk.Label(
-                frame,
-                text="请远眺放松，倒计时结束后将自动关闭",
-                font=self._pick_font(14),
-                fg=MUTED,
-                bg=BG,
-            )
-            hint.pack(pady=(0, 28))
+        hint = tk.Label(
+            frame,
+            text="请远眺放松，倒计时结束后将自动关闭",
+            font=self._pick_font(14),
+            fg=MUTED,
+            bg=BG,
+        )
+        hint.pack(pady=(0, 28))
+        self._hint_labels.append(hint)
+        if is_primary:
             self._primary_labels["hint"] = hint
 
-            if self.config.allow_skip:
-                btn = tk.Button(
-                    frame,
-                    text="跳过本次休息（不推荐）",
-                    font=self._pick_font(12),
-                    fg=BG,
-                    bg=WARN,
-                    activebackground="#e0b888",
-                    relief="flat",
-                    padx=16,
-                    pady=8,
-                    command=self._skip_with_warning,
-                )
-                btn.pack()
-                self._dismiss_btn = btn
-            else:
-                # 倒计时结束后才出现“我已休息好”按钮（可选提前关，但默认时间已到）
-                btn = tk.Button(
-                    frame,
-                    text="我已休息好",
-                    font=self._pick_font(14, bold=True),
-                    fg=BG,
-                    bg=ACCENT,
-                    activebackground="#4cb08c",
-                    relief="flat",
-                    padx=20,
-                    pady=10,
-                    command=self.close,
-                    state="disabled",
-                )
-                btn.pack()
+        if self.config.allow_skip:
+            btn = tk.Button(
+                frame,
+                text="跳过本次休息（不推荐）",
+                font=self._pick_font(12),
+                fg=BG,
+                bg=WARN,
+                activebackground="#e0b888",
+                relief="flat",
+                padx=16,
+                pady=8,
+                command=self._skip_with_warning,
+            )
+            btn.pack()
+            self._dismiss_buttons.append(btn)
+            if is_primary or self._dismiss_btn is None:
                 self._dismiss_btn = btn
         else:
-            # 副屏：简洁遮罩，避免多处倒计时干扰
-            label = tk.Label(
+            # 倒计时结束后才出现“我已休息好”按钮（可选提前关，但默认时间已到）
+            btn = tk.Button(
                 frame,
-                text="护眼休息中…",
-                font=self._pick_font(28, bold=True),
-                fg=ACCENT,
-                bg=BG,
+                text="我已休息好",
+                font=self._pick_font(14, bold=True),
+                fg=BG,
+                bg=ACCENT,
+                activebackground="#4cb08c",
+                relief="flat",
+                padx=20,
+                pady=10,
+                command=self.close,
+                state="disabled",
             )
-            label.pack()
+            btn.pack()
+            self._dismiss_buttons.append(btn)
+            if is_primary or self._dismiss_btn is None:
+                self._dismiss_btn = btn
 
         # 阻断键盘/鼠标落到下层窗口（各屏尽量 grab；主屏优先）
         try:
@@ -646,16 +675,24 @@ class BreakOverlay:
     def _tick(self) -> None:
         if self._closed:
             return
-        label = self._primary_labels.get("countdown")
-        if label is not None:
-            label.configure(text=str(self._remaining))
+        for label in self._countdown_labels:
+            try:
+                label.configure(text=str(self._remaining))
+            except tk.TclError:
+                pass
 
         if self._remaining <= 0:
-            hint = self._primary_labels.get("hint")
-            if hint is not None:
-                hint.configure(text="休息结束，可以继续工作了")
-            if self._dismiss_btn is not None and not self.config.allow_skip:
-                self._dismiss_btn.configure(state="normal")
+            for hint in self._hint_labels:
+                try:
+                    hint.configure(text="休息结束，可以继续工作了")
+                except tk.TclError:
+                    pass
+            if not self.config.allow_skip:
+                for btn in self._dismiss_buttons:
+                    try:
+                        btn.configure(state="normal")
+                    except tk.TclError:
+                        pass
             # 自动关闭：给用户约 1.5 秒读完“休息结束”
             self._countdown_job = self.root.after(1500, self.close)
             return
@@ -1956,7 +1993,7 @@ class MacStatusUI:
                 break
             try:
                 if action == "break":
-                    LOG.info("菜单「立即开始休息」：由 Tk 轮询执行")
+                    LOG.info("菜单「立即开始休息」：由 Tk 轮询执行 → 与定时器同一 start_break/BreakOverlay")
                     self.on_break()
                 elif action == "exit":
                     LOG.info("菜单「退出」：由 Tk 轮询执行")

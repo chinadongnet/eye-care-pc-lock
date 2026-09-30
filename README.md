@@ -194,8 +194,8 @@ python3 eye_care.py -c /path/to/config.json
 ## 多显示器
 
 - **Windows**：枚举所有显示器，每块屏幕铺满置顶遮罩
-- **macOS**：优先通过 CoreGraphics/Quartz（ctypes）枚举多屏；失败时回退到 tkinter 主屏
-- 主屏显示完整倒计时与文案，副屏显示简洁「护眼休息中…」提示
+- **macOS**：优先通过 AppKit `NSScreen`（PyObjC）枚举多屏并换算为 Tk 坐标；失败时回退到 tkinter 主屏（不使用 ctypes `CGDisplayBounds`，避免 Apple Silicon 上 CGRect 错算）
+- 每块屏幕显示**同一套**完整遮罩（标题 / 文案 / 倒计时）；系统主屏优先 grab 焦点。菜单「立即开始休息」与定时器走同一 `BreakOverlay`
 
 ---
 
