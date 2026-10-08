@@ -73,29 +73,23 @@ ensure_service_dir() {
 }
 
 kill_stragglers() {
-  # 仅结束本 ROOT / Application Support 路径下的 eye_care.py
-  local pid args app_support="$HOME/Library/Application Support/eye-care-lock/eye_care.py"
-  local -a ours=()
-  for pid in $(pgrep -f "[e]ye_care.py" 2>/dev/null || true); do
-    [[ -z "$pid" ]] && continue
-    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-    case "$args" in
-      *"${app_support}"*) ours+=("$pid") ;;
-      *"${ROOT}/eye_care.py"*) ours+=("$pid") ;;
-    esac
-  done
-  if [[ ${#ours[@]} -eq 0 ]]; then
+  local pids
+  pids="$(pgrep -f "[e]ye_care.py" || true)"
+  if [[ -z "$pids" ]]; then
     return 0
   fi
-  for pid in "${ours[@]}"; do
+  echo "$pids" | while read -r pid; do
+    [[ -z "$pid" ]] && continue
     kill "$pid" 2>/dev/null || true
   done
   sleep 1
-  for pid in "${ours[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
+  pids="$(pgrep -f "[e]ye_care.py" || true)"
+  if [[ -n "$pids" ]]; then
+    echo "$pids" | while read -r pid; do
+      [[ -z "$pid" ]] && continue
       kill -9 "$pid" 2>/dev/null || true
-    fi
-  done
+    done
+  fi
 }
 
 launchagent_bootout() {
