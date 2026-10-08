@@ -1,24 +1,17 @@
 @echo off
-REM 护眼锁屏助手启动脚本（Windows）
-REM 使用 pythonw 可隐藏控制台；若需看日志请改用 python。
-
+REM Windows 安装入口。双击或带参数调用时走 PowerShell 启动脚本：
+REM 检查 tkinter、后台只启动一份、写入登录自启（不含 --once 等一次性参数）。
 setlocal
 cd /d "%~dp0"
 
-where pythonw >nul 2>&1
-if %ERRORLEVEL%==0 (
-  start "护眼锁屏助手" pythonw "%~dp0eye_care.py" %*
-  echo 已在后台启动护眼锁屏助手。可在系统托盘右键退出。
-  exit /b 0
+where powershell >nul 2>&1
+if errorlevel 1 (
+  echo 未找到 PowerShell，无法完成 Windows 安装启动。
+  pause
+  exit /b 1
 )
 
-where python >nul 2>&1
-if %ERRORLEVEL%==0 (
-  start "护眼锁屏助手" python "%~dp0eye_care.py" %*
-  echo 已启动护眼锁屏助手（带控制台窗口，Ctrl+C 可退出）。
-  exit /b 0
-)
-
-echo 未找到 python / pythonw，请先安装 Python 3.11+ 并勾选 Add to PATH。
-pause
-exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_eye_care.ps1" %*
+set EXITCODE=%ERRORLEVEL%
+if not "%EXITCODE%"=="0" pause
+exit /b %EXITCODE%

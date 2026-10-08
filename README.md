@@ -1,6 +1,6 @@
 # 护眼锁屏助手
 
-版本 **1.0.0**。Windows / macOS 定时护眼工具：默认每 **20 分钟**弹出全屏置顶遮罩，提示按 **20-20-20** 法则远眺休息 **20 秒**，倒计时结束后自动关闭。
+版本 **1.0.1**。Windows / macOS 定时护眼工具：默认每 **20 分钟**弹出全屏置顶遮罩，提示按 **20-20-20** 法则远眺休息 **20 秒**，倒计时结束后自动关闭。已发布的 macOS 安装包仍是 1.0.0。
 
 - 运行环境：Windows 10+ / Windows Server 2022，或 macOS 12+（Apple Silicon / Intel），Python 3.11+（需 tkinter）
 - **无需管理员权限**；默认**无需 pip**（标准库：`tkinter` + `ctypes` + `subprocess`）
@@ -15,9 +15,9 @@
 |------|------|
 | `eye_care.py` | 主程序 |
 | `config.json` | 默认配置（间隔、时长、文案等） |
-| `start_eye_care.bat` | Windows 双击启动（后台） |
-| `start_eye_care.ps1` | Windows PowerShell 启动（可传参数） |
-| `stop_eye_care.ps1` | Windows 结束进程 |
+| `start_eye_care.bat` | Windows 双击安装启动：检查 tkinter、后台启动、写入登录自启 |
+| `start_eye_care.ps1` | Windows PowerShell 启动（可传参数）；`-NoAutostart` 不写登录自启 |
+| `stop_eye_care.ps1` | Windows：只结束本目录进程；`-DisableAutostart` 关闭登录自启 |
 | `start_eye_care.sh` | macOS：LaunchAgent 后台启动（无 Terminal）+ 登录自启；`--show-console` 前台 |
 | `stop_eye_care.sh` | macOS：bootout LaunchAgent + 结束进程；`--disable-autostart` 关闭自启 |
 | `start_eye_care.command` | macOS Finder 双击启动（显示控制台） |
@@ -38,7 +38,10 @@ python eye_care.py
 ```powershell
 .\start_eye_care.ps1
 .\start_eye_care.ps1 -ShowConsole
+.\start_eye_care.ps1 -NoAutostart
 ```
+
+脚本会跳过 Microsoft Store 的 `python.exe` 占位符，并确认解释器能 `import tkinter` 后再启动。默认再写一份当前用户的「开机自动启动」快捷方式（下次登录才生效，不会立刻再开一份）。一次性参数 `-Once`、`-DemoSeconds`、`-VerboseLog` 不会写进该快捷方式。
 
 启动后：
 
@@ -162,7 +165,9 @@ python3 eye_care.py -c /path/to/config.json
 
 ### Windows
 
-**托盘 / HUD 菜单**：勾选「开机自动启动」即可写入当前用户 Startup（保留持久 CLI 参数，排除 `--once` / `--demo-seconds` / `-v`）。
+**启动脚本**：`start_eye_care.bat` / `start_eye_care.ps1` 默认写入当前用户 Startup 快捷方式「护眼锁屏助手」（与托盘菜单同一名字）。`stop_eye_care.ps1 -DisableAutostart` 删除它。快捷方式只保留持久参数，不含 `--once` / `--demo-seconds` / `-v`。
+
+**托盘 / HUD 菜单**：勾选「开机自动启动」同样写入该快捷方式。
 
 也可手动：
 

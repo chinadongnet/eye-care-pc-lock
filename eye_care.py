@@ -51,7 +51,7 @@ if IS_WINDOWS:
 
 
 APP_NAME = "护眼锁屏助手"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = APP_DIR / "config.json"
 LOG = logging.getLogger("eye_care")
