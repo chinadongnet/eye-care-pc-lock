@@ -404,9 +404,20 @@ def _macos_show_dialog_detached(title: str, message: str, button: str = "好") -
         return False
 
 
+def _about_summary() -> str:
+    """关于界面正文。版本号与 VERSION / 发布标签一致。"""
+    return (
+        f"版本 {APP_VERSION}\n"
+        "定时全屏护眼提醒。\n"
+        "默认每 20 分钟休息 20 秒。\n"
+        "配置见 config.json。"
+    )
+
+
 def _macos_about_body() -> str:
     return (
         f"{APP_NAME}\n"
+        f"版本 {APP_VERSION}\n"
         "================\n\n"
         "定时全屏护眼提醒。\n"
         "默认每 20 分钟休息 20 秒。\n"
@@ -1483,7 +1494,7 @@ class TrayIcon:
                 elif cmd == ID_TRAY_ABOUT:
                     user32.MessageBoxW(
                         hwnd,
-                        "定时全屏护眼提醒。\n默认每 20 分钟休息 20 秒。\n配置见 config.json。",
+                        _about_summary(),
                         APP_NAME,
                         0,
                     )
@@ -1751,7 +1762,7 @@ class MacStatusUI:
                 try:
                     LOG.info("菜单栏「关于」：外部打开 ABOUT.txt（绕过 Tk）")
                     if not _macos_show_about_external():
-                        LOG.info("关于：定时全屏护眼提醒，见 config.json")
+                        LOG.info("关于：%s 版本 %s", APP_NAME, APP_VERSION)
                 except Exception:  # noqa: BLE001
                     LOG.exception("菜单栏「关于」失败")
 
@@ -2134,7 +2145,7 @@ class MacStatusUI:
         LOG.info("HUD「关于」：外部打开 ABOUT.txt（不碰 messagebox / NSAlert / after）")
         if IS_MAC and _macos_show_about_external():
             return
-        LOG.info("关于：定时全屏护眼提醒，见 config.json")
+        LOG.info("关于：%s 版本 %s", APP_NAME, APP_VERSION)
 
     def _toggle_autostart(self) -> None:
         want = not is_autostart_enabled()
@@ -2413,7 +2424,7 @@ class EyeCareApp:
                 try:
                     ctypes.windll.user32.MessageBoxW(
                         None,
-                        "定时全屏护眼提醒。\n默认每 20 分钟休息 20 秒。\n配置见 config.json。",
+                        _about_summary(),
                         APP_NAME,
                         0,
                     )
@@ -2425,10 +2436,10 @@ class EyeCareApp:
 
                 messagebox.showinfo(
                     APP_NAME,
-                    "定时全屏护眼提醒。\n默认每 20 分钟休息 20 秒。\n配置见 config.json。",
+                    _about_summary(),
                 )
             except Exception:  # noqa: BLE001
-                LOG.info("关于：见 config.json")
+                LOG.info("关于：%s 版本 %s", APP_NAME, APP_VERSION)
 
         def on_toggle_autostart() -> None:
             want = not is_autostart_enabled()
