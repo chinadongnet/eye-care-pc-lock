@@ -51,6 +51,7 @@ if IS_WINDOWS:
 
 
 APP_NAME = "护眼锁屏助手"
+APP_VERSION = "1.0.0"
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = APP_DIR / "config.json"
 LOG = logging.getLogger("eye_care")
@@ -165,6 +166,24 @@ def load_config(path: Path) -> Config:
 MonitorRect = Tuple[int, int, int, int]  # left, top, right, bottom
 
 
+def _tk_geometry(width: int, height: int, x: int, y: int) -> str:
+    """Tk geometry with correct signs for negative offsets.
+
+    Tk wants ``WxH±x±y`` (e.g. ``1920x1080-192-1080``), not ``+{neg}`` which
+    yields the invalid form ``+-192``.
+    """
+    xs = f"+{x}" if x >= 0 else str(x)
+    ys = f"+{y}" if y >= 0 else str(y)
+    return f"{width}x{height}{xs}{ys}"
+
+
+def _tk_position(x: int, y: int) -> str:
+    """Tk position-only geometry ``±x±y`` (drag / reposition)."""
+    xs = f"+{x}" if x >= 0 else str(x)
+    ys = f"+{y}" if y >= 0 else str(y)
+    return f"{xs}{ys}"
+
+
 def _primary_monitor_tk() -> List[MonitorRect]:
     """用 tkinter 探测主屏尺寸（回退路径）。"""
     root = tk.Tk()
@@ -200,8 +219,21 @@ def _get_monitors_mac() -> List[MonitorRect]:
         screens = list(NSScreen.screens() or [])
         if not screens:
             raise RuntimeError("NSScreen.screens() empty")
-        main = NSScreen.mainScreen() or screens[0]
-        main_height = float(main.frame().size.height)
+        # NSScreen.mainScreen() 是当前焦点屏，不一定是坐标原点所在的主屏。
+        # Y 翻转必须用包含 Cocoa 全局原点 (0, 0) 的那块屏的高度。
+        origin_height = None
+        for screen in screens:
+            frame = screen.frame()
+            x = float(frame.origin.x)
+            y = float(frame.origin.y)
+            w = float(frame.size.width)
+            h = float(frame.size.height)
+            if x <= 0.0 < x + w and y <= 0.0 < y + h:
+                origin_height = h
+                break
+        if origin_height is None:
+            origin_height = float(screens[0].frame().size.height)
+        main_height = origin_height
         monitors: List[MonitorRect] = []
         for screen in screens:
             rect = _cocoa_frame_to_tk(screen.frame(), main_height)
@@ -514,7 +546,7 @@ class BreakOverlay:
         except tk.TclError:
             pass
 
-        geom = f"{width}x{height}+{left}+{top}"
+        geom = _tk_geometry(width, height, left, top)
         win.geometry(geom)
         win.deiconify()
         # macOS：deiconify 后偶发忽略首轮 geometry，再设一次并 update
@@ -814,8 +846,57 @@ def _mac_service_dir(script: Path) -> Path:
     return script.parent
 
 
+def _persistent_config_source(source_dir: Path) -> Optional[Path]:
+    """持久参数里的 ``-c`` / ``--config``，相对路径按源码目录解析。"""
+    argv = list(_PERSISTENT_ARGV)
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        token: Optional[str] = None
+        if arg in ("-c", "--config") and i + 1 < len(argv):
+            token = argv[i + 1]
+        elif arg.startswith("--config="):
+            token = arg.split("=", 1)[1]
+        if token is not None:
+            src = Path(token)
+            if not src.is_absolute():
+                src = source_dir / src
+            return src
+        i += 1
+    return None
+
+
+def _rewrite_persistent_config_arg(dest: Path) -> None:
+    """把持久参数中的配置路径改成服务目录里的副本。"""
+    global _PERSISTENT_ARGV
+    argv = list(_PERSISTENT_ARGV)
+    out: List[str] = []
+    i = 0
+    replaced = False
+    while i < len(argv):
+        arg = argv[i]
+        if not replaced and arg in ("-c", "--config") and i + 1 < len(argv):
+            out.extend([arg, str(dest)])
+            i += 2
+            replaced = True
+            continue
+        if not replaced and arg.startswith("--config="):
+            out.append(f"--config={dest}")
+            i += 1
+            replaced = True
+            continue
+        out.append(arg)
+        i += 1
+    _PERSISTENT_ARGV = out
+
+
 def _mac_sync_service_files(script: Path) -> Path:
-    """若脚本在 TCC 目录，同步到 Application Support 并返回服务端脚本路径。"""
+    """若脚本在 TCC 目录，同步到 Application Support 并返回服务端脚本路径。
+
+    源目录没有 ``config.json`` 时删掉服务目录里的旧副本，避免回到默认配置后
+    仍读到过期间隔。``-c`` / ``--config`` 指向的文件会一并复制，并把持久参数
+    改写成服务目录中的路径（LaunchAgent 的工作目录不再是源码目录）。
+    """
     script = script.resolve()
     service_dir = _mac_service_dir(script)
     if service_dir == script.parent:
@@ -823,10 +904,22 @@ def _mac_sync_service_files(script: Path) -> Path:
     service_dir.mkdir(parents=True, exist_ok=True)
     import shutil
 
-    for name in ("eye_care.py", "config.json"):
-        src = script.parent / name
-        if src.is_file():
-            shutil.copy2(src, service_dir / name)
+    shutil.copy2(script, service_dir / "eye_care.py")
+    src_default = script.parent / "config.json"
+    dest_default = service_dir / "config.json"
+    if src_default.is_file():
+        shutil.copy2(src_default, dest_default)
+    elif dest_default.is_file():
+        dest_default.unlink()
+
+    custom = _persistent_config_source(script.parent)
+    if custom is not None:
+        if custom.is_file():
+            dest = service_dir / custom.name
+            shutil.copy2(custom, dest)
+            _rewrite_persistent_config_arg(dest)
+        else:
+            _rewrite_persistent_config_arg(custom.resolve())
     return service_dir / "eye_care.py"
 
 
@@ -973,32 +1066,30 @@ def _set_autostart_windows(enabled: bool) -> bool:
 
 
 def _set_autostart_mac(enabled: bool) -> bool:
+    """安装或移除 LaunchAgent plist，供下次登录使用。
+
+    从已在运行的 app 里切换自启时只写/删 plist，不调用
+    ``launchctl bootstrap/load/bootout``。否则开启会再拉起第二份进程，
+    关闭则会结束当前由 LaunchAgent 托管的进程。立即启停用启动/停止脚本。
+    """
     agents = _mac_launch_agents_dir()
     agents.mkdir(parents=True, exist_ok=True)
     plist = _mac_plist_path()
     if not enabled:
         if plist.is_file():
-            _mac_launchctl("bootout", plist)
-            _mac_launchctl("unload", plist)
             try:
                 plist.unlink()
             except OSError as exc:
                 LOG.error("删除 LaunchAgent 失败: %s", exc)
                 return False
-        LOG.info("已关闭开机自启（LaunchAgent）")
+        LOG.info("已关闭开机自启（已移除 LaunchAgent plist；当前进程继续运行）")
         return True
 
     python = _python_for_autostart()
     script = _mac_sync_service_files(Path(__file__).resolve())
     body = _build_mac_plist(python, script)
-    # 先卸再写，避免残留旧定义
-    if plist.is_file():
-        _mac_launchctl("bootout", plist)
-        _mac_launchctl("unload", plist)
     plist.write_text(body, encoding="utf-8")
-    _mac_launchctl("bootstrap", plist)
-    _mac_launchctl("load", plist)
-    LOG.info("已开启开机自启: %s", plist)
+    LOG.info("已开启开机自启: %s（仅写入 plist，下次登录生效）", plist)
     return True
 
 
@@ -2133,7 +2224,7 @@ class CountdownHud:
         on_break: Callable[[], None],
         on_exit: Callable[[], None],
         on_about: Callable[[], None],
-        on_toggle_autostart: Callable[[], None],
+        on_toggle_autostart: Optional[Callable[[], None]],
         get_status_label: Callable[[], str],
         get_autostart: Callable[[], bool],
     ) -> None:
@@ -2153,7 +2244,7 @@ class CountdownHud:
         sh = self.win.winfo_screenheight()
         x = max(0, sw - w - 24)
         y = max(0, sh - h - 72)
-        self.win.geometry(f"{w}x{h}+{x}+{y}")
+        self.win.geometry(_tk_geometry(w, h, x, y))
 
     def _start_drag(self, event) -> None:  # noqa: ANN001
         self._drag_x = event.x_root - self.win.winfo_x()
@@ -2165,7 +2256,9 @@ class CountdownHud:
     def _on_drag(self, event) -> None:  # noqa: ANN001
         if abs(event.x_root - self._press_x_root) > 4 or abs(event.y_root - self._press_y_root) > 4:
             self._dragging = True
-        self.win.geometry(f"+{event.x_root - self._drag_x}+{event.y_root - self._drag_y}")
+        self.win.geometry(
+            _tk_position(event.x_root - self._drag_x, event.y_root - self._drag_y)
+        )
 
     def _end_drag(self, event) -> None:  # noqa: ANN001
         # 预留：左键短按不弹菜单，避免与拖动冲突；菜单用右键 / Control+点击
@@ -2179,9 +2272,10 @@ class CountdownHud:
         menu.add_command(label=status[:64], state="disabled")
         menu.add_separator()
         menu.add_command(label="立即开始休息", command=self._menu_on_break)
-        auto_on = bool(self._menu_get_autostart() if self._menu_get_autostart else False)
-        auto_label = "开机自动启动 ✓" if auto_on else "开机自动启动"
-        menu.add_command(label=auto_label, command=self._menu_on_toggle_autostart)
+        if self._menu_on_toggle_autostart is not None:
+            auto_on = bool(self._menu_get_autostart() if self._menu_get_autostart else False)
+            auto_label = "开机自动启动 ✓" if auto_on else "开机自动启动"
+            menu.add_command(label=auto_label, command=self._menu_on_toggle_autostart)
         menu.add_command(label="关于", command=self._menu_on_about)
         menu.add_separator()
         menu.add_command(label="退出", command=self._menu_on_exit)
@@ -2235,6 +2329,42 @@ class CountdownHud:
 
 
 # ---------------------------------------------------------------------------
+# 非 macOS / Windows：仅 HUD（无菜单栏、无开机自启项）
+# ---------------------------------------------------------------------------
+class HudOnlyStatus:
+    """Linux 等平台的状态桩。不提供开机自启菜单。"""
+
+    def __init__(
+        self,
+        on_break: Callable[[], None],
+        on_exit: Callable[[], None],
+        tooltip: str = APP_NAME,
+    ) -> None:
+        self.on_break = on_break
+        self.on_exit = on_exit
+        self.tooltip = tooltip
+        self.status_label = tooltip
+
+    def start(self) -> None:
+        LOG.info("非 Windows/macOS：悬浮 HUD 右键菜单可用；不提供开机自启。")
+
+    def stop(self) -> None:
+        return
+
+    def set_status(
+        self,
+        tip: str,
+        menu_label: Optional[str] = None,
+        minutes: Optional[int] = None,
+        resting: bool = False,
+    ) -> None:
+        self.tooltip = tip
+        if menu_label is not None:
+            self.status_label = menu_label
+        _ = (minutes, resting)
+
+
+# ---------------------------------------------------------------------------
 # 主应用
 # ---------------------------------------------------------------------------
 class EyeCareApp:
@@ -2258,10 +2388,16 @@ class EyeCareApp:
             on_break = lambda: self.root.after(0, self.start_break)
             on_exit = lambda: self.root.after(0, self.request_exit)
             self.tray = TrayIcon(on_break=on_break, on_exit=on_exit, tooltip=tip)
-        else:
+        elif IS_MAC:
             # macOS：AppKit 菜单经 MacStatusUI 动作队列入队，由 Tk 轮询执行。
             # 此处必须传裸回调；禁止再包一层 root.after（AppKit 路径会 SIGABRT）。
             self.tray = MacStatusUI(
+                on_break=self.start_break,
+                on_exit=self.request_exit,
+                tooltip=tip,
+            )
+        else:
+            self.tray = HudOnlyStatus(
                 on_break=self.start_break,
                 on_exit=self.request_exit,
                 tooltip=tip,
@@ -2307,6 +2443,15 @@ class EyeCareApp:
 
         if isinstance(self.tray, MacStatusUI):
             self.tray.attach_hud(self.hud)
+        elif isinstance(self.tray, HudOnlyStatus):
+            self.hud.bind_status_menu(
+                on_break=self.start_break,
+                on_exit=self.request_exit,
+                on_about=on_about,
+                on_toggle_autostart=None,
+                get_status_label=lambda: self.tray.status_label,
+                get_autostart=lambda: False,
+            )
         else:
             self.hud.bind_status_menu(
                 on_break=lambda: self.root.after(0, self.start_break),
@@ -2320,8 +2465,9 @@ class EyeCareApp:
     def run(self) -> None:
         interval_sec = self.config.interval_minutes * 60
         LOG.info(
-            "%s 已启动 | 间隔 %.3g 分钟 | 休息 %d 秒 | 锁屏=%s | 允许跳过=%s",
+            "%s %s 已启动 | 间隔 %.3g 分钟 | 休息 %d 秒 | 锁屏=%s | 允许跳过=%s",
             APP_NAME,
+            APP_VERSION,
             self.config.interval_minutes,
             self.config.break_seconds,
             self.config.lock_workstation,

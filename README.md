@@ -1,6 +1,6 @@
 # 护眼锁屏助手
 
-Windows / macOS 定时护眼工具：默认每 **20 分钟**弹出全屏置顶遮罩，提示按 **20-20-20** 法则远眺休息 **20 秒**，倒计时结束后自动关闭。
+版本 **1.0.0**。Windows / macOS 定时护眼工具：默认每 **20 分钟**弹出全屏置顶遮罩，提示按 **20-20-20** 法则远眺休息 **20 秒**，倒计时结束后自动关闭。
 
 - 运行环境：Windows 10+ / Windows Server 2022，或 macOS 12+（Apple Silicon / Intel），Python 3.11+（需 tkinter）
 - **无需管理员权限**；默认**无需 pip**（标准库：`tkinter` + `ctypes` + `subprocess`）
@@ -173,7 +173,7 @@ python3 eye_care.py -c /path/to/config.json
 
 **推荐**：运行 `./start_eye_care.sh` 即写入并加载 LaunchAgent（后台运行 + 登录自启）。
 
-**菜单栏 / HUD 菜单**：勾选「开机自动启动」会写入同一用户 LaunchAgent：
+**菜单栏 / HUD 菜单**：勾选「开机自动启动」只写入同一用户 LaunchAgent，下次登录再生效，不会立刻再启动一份进程：
 
 | 项 | 值 |
 |----|----|
@@ -185,7 +185,7 @@ python3 eye_care.py -c /path/to/config.json
 
 同样保留持久 CLI 参数（排除 `--once` / `--demo-seconds` / verbose）。
 
-**注意（macOS TCC）**：若应用放在 `Desktop` / `Documents` / `Downloads`，LaunchAgent 无法直接读取该路径。`start_eye_care.sh` 与菜单「开机自动启动」会把 `eye_care.py` / `config.json` 同步到 `~/Library/Application Support/eye-care-lock/` 再由 launchd 运行（无 Terminal）。日志在该目录的 `eye_care.log`。
+**注意（macOS TCC）**：若应用放在 `Desktop` / `Documents` / `Downloads`，LaunchAgent 无法直接读取该路径。`start_eye_care.sh` 与菜单「开机自动启动」会把 `eye_care.py`、`config.json`，以及 `-c` / `--config` 指定的配置，同步到 `~/Library/Application Support/eye-care-lock/` 再由 launchd 运行（无 Terminal）。源目录里删掉 `config.json` 后，服务目录里的旧副本也会去掉。写入登录自启的参数会去掉 `--once`、`--demo-seconds` 和 `-v`。日志在该目录的 `eye_care.log`。
 
 关闭自启：菜单取消勾选，或 `./stop_eye_care.sh --disable-autostart`（删除 plist 并 bootout）。
 
